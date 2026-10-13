@@ -32,6 +32,21 @@ The build stages `.build/plugin-claude/` and validates it with the official CLI.
 
 The native manager reads this local package in place. To load source changes, stop active DeLM work, rebuild, and restart Claude Code. Keep the checkout and staged package available while this source installation is registered. For a session without marketplace registration, open the intended project and use `claude --plugin-dir /absolute/path/to/this-checkout/.build/plugin-claude` instead.
 
+### Pi plugin
+
+Install [Pi](https://pi.dev) (`npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, Node.js 22.19 or later) and log in to a provider with `/login`. Build and install the package as a local Pi package:
+
+```sh
+./scripts/build.sh --host pi
+pi install "$PWD/.build/plugin-pi"
+```
+
+The build stages `.build/plugin-pi/` with the runtime, both extensions, the shared worker policy and the manifest, and checks the TypeScript syntax with Node. Pi loads the package from that path in place; rebuild and start a new Pi session to pick up changes. Open the intended project in `pi` and invoke `/delm:run <task>`; `/delm:status` and `/delm:stop` are the other commands. `pi remove "$PWD/.build/plugin-pi"` uninstalls it. Pi resources live in `hosts/pi/`; the controller is shared with Claude Code (`delm pi serve`, see [Pi integration](pi-integration.md)).
+
+For one session without installing, use `pi -e /absolute/path/to/this-checkout/hosts/pi/extensions/delm.ts` with `DELM_PI_RUNTIME` pointing at a built runtime; the worker extension is loaded by path into each worker.
+
+The npm installer does not manage Pi yet: a Pi package is installed from npm or a git ref, and the runtime binary must ship inside it, which needs its own release step.
+
 ### Shared builds
 
 `./scripts/build.sh --host all` builds the runtime once and stages both packages. A compatible prebuilt runtime can be supplied with `--prebuilt /absolute/path/to/delm`. Neither staging operation installs a plugin or changes the user's native permissions.
@@ -42,7 +57,7 @@ The native manager reads this local package in place. To load source changes, st
 ./scripts/verify.sh
 ```
 
-This runs Rust formatting, linting, and tests; Python packaging and qualification-helper tests; installer tests; and Claude module tests. The deterministic suites cover task ownership, publication/import checks, shared verification, service ownership, guarded original-project delivery, recovery, and cleanup.
+This runs Rust formatting, linting, and tests; Python packaging and qualification-helper tests; installer tests; and Claude module tests. Pi host tests run separately with `npm --prefix hosts/pi test`: unit tests for the host protocol helpers, and a model-free lifecycle fixture that drives the real parent extension under the installed `pi` in RPC mode with two scripted workers against the real controller, sidecar and delivery (skipped when `pi` or a debug runtime is missing). The deterministic suites cover task ownership, publication/import checks, shared verification, service ownership, guarded original-project delivery, recovery, and cleanup.
 
 CI tests the configured Codex and Claude versions on native Apple Silicon and Intel runners, and their latest versions together on Apple Silicon. Host upgrades must pass the same model-free checks, including the production Codex invocation below. A passing schema or installation check alone does not establish working startup. Support applies to the exact host version, architecture, source, and runtime covered by passing evidence; a latest-version job does not establish support before it passes.
 

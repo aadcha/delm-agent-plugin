@@ -4,7 +4,7 @@
   </a>
 </p>
 
-<h1 align="center">DeLM for Codex and Claude Code</h1>
+<h1 align="center">DeLM for Codex, Claude Code and Pi</h1>
 <p align="center">Build faster with agents that work together.</p>
 
 <p align="center">
@@ -57,6 +57,7 @@ Open your host in the project you want to change, then invoke DeLM with a reques
 | --- | --- |
 | Codex | `$delm:run <your task>` |
 | Claude Code | `/delm:run <your task>` |
+| Pi | `/delm:run <your task>` (contributor build; see [development](docs/development.md#pi-plugin)) |
 
 For example, in Claude Code:
 
@@ -92,6 +93,7 @@ Codex workers preserve saved skills, plugins, hooks, MCP configuration, and perm
 | [Contributing](CONTRIBUTING.md) | Development setup and verification |
 | [Release guide](docs/releases.md) | Build qualification and distribution |
 | [Claude integration](docs/claude-integration.md) | Native integration design and validation |
+| [Pi integration](docs/pi-integration.md) | Pi host design: RPC workers, tickets, evidence |
 
 ## Research
 

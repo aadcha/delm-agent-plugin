@@ -26,14 +26,22 @@ CLAUDE_PACKAGE_FILES = (
     "hooks/delm.js", "hooks/protocol.js", "hooks/board-view.js", "hooks/board-render.js",
     "hooks/worker.md", "LICENSE", "NOTICE", DEPENDENCY_NOTICES,
 )
-HOST_PACKAGE_FILES = {"codex": PACKAGE_FILES, "claude": CLAUDE_PACKAGE_FILES}
+PI_PACKAGE_FILES = (
+    "package.json", "README.md", "extensions/delm.ts", "extensions/delm-worker.ts",
+    "lib/protocol.ts", "lib/rpc.ts", "lib/bridge.ts", "lib/control.ts",
+    "worker.md", "LICENSE", "NOTICE", DEPENDENCY_NOTICES,
+)
+HOST_PACKAGE_FILES = {"codex": PACKAGE_FILES, "claude": CLAUDE_PACKAGE_FILES, "pi": PI_PACKAGE_FILES}
+PUBLISHED_NAMES = {"codex": "plugin", "claude": "plugin-claude", "pi": "plugin-pi"}
 
 
 def package_source(source, name, host):
     if host == "claude" and name == "hooks/worker.md":
         return source / "plugin/worker.md"
-    if host == "claude" and name not in {"LICENSE", "NOTICE", DEPENDENCY_NOTICES}:
-        return source / "hosts/claude" / name
+    if host == "pi" and name == "worker.md":
+        return source / "plugin/worker.md"
+    if host in {"claude", "pi"} and name not in {"LICENSE", "NOTICE", DEPENDENCY_NOTICES}:
+        return source / f"hosts/{host}" / name
     return source / name
 
 
@@ -128,6 +136,20 @@ def validate_claude_package(package, claude="claude"):
             "passed": True, "modelCalls": 0, "payloadSha256": payload_digest(package)}
 
 
+def validate_pi_package(package):
+    """Pi loads TypeScript through jiti at runtime; check the manifest and syntax offline."""
+    manifest = json.loads((package / "package.json").read_text())
+    declared = manifest.get("pi", {}).get("extensions", [])
+    if sorted(declared) != ["./extensions/delm-worker.ts", "./extensions/delm.ts"]:
+        raise RuntimeError("The Pi package manifest must declare exactly the two DeLM extensions.")
+    if shutil.which("node") is None:
+        raise RuntimeError("Node.js is required to validate the Pi package.")
+    for name in PI_PACKAGE_FILES:
+        if name.endswith(".ts"):
+            subprocess.run(["node", "--experimental-strip-types", "--check", str(package / name)], check=True)
+    return {"kind": "pi-package-validation", "extensions": declared}
+
+
 def stage_package(source, runtime, package, host="codex"):
     """Stage only runtime resources, never a checkout or its local artifacts."""
     if host not in HOST_PACKAGE_FILES:
@@ -171,7 +193,9 @@ def build(source, prebuilt=None, host="codex", claude="claude"):
             if selected == "claude":
                 validate_claude_runtime(package / "bin/delm")
                 validate_claude_package(package, claude)
-            published = build_root / ("plugin" if selected == "codex" else "plugin-claude")
+            if selected == "pi":
+                validate_pi_package(package)
+            published = build_root / PUBLISHED_NAMES[selected]
             if os.path.lexists(published) and (not published.is_dir() or published.is_symlink()):
                 raise RuntimeError(f"Refusing to replace an unrelated path: {published}")
             staged.append((selected, package, published))

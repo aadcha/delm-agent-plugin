@@ -75,6 +75,16 @@ def fixture_source(path):
     skill = path / "hosts/claude/skills/run/SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text("---\nname: run\ndescription: Unit-test package fixture.\n---\nDo not run.\n")
+    for directory in ("hosts/pi/extensions", "hosts/pi/lib"):
+        (path / directory).mkdir(parents=True, exist_ok=True)
+    package_release.write_json(path / "hosts/pi/package.json", {
+        "name": "delm-pi", "version": version, "type": "module",
+        "pi": {"extensions": ["./extensions/delm.ts", "./extensions/delm-worker.ts"]},
+    })
+    (path / "hosts/pi/README.md").write_text("# Unit-test package fixture\n")
+    for name in ("extensions/delm.ts", "extensions/delm-worker.ts",
+                 "lib/protocol.ts", "lib/rpc.ts", "lib/bridge.ts", "lib/control.ts"):
+        (path / "hosts/pi" / name).write_text("export const fixture: boolean = true;\n")
     return path
 
 
@@ -627,6 +637,24 @@ class BuildTests(unittest.TestCase):
                              {*build.CLAUDE_PACKAGE_FILES, "bin/delm"})
             self.assertEqual((source / ".build/plugin-claude/hooks/worker.md").read_bytes(),
                              (source / "plugin/worker.md").read_bytes())
+
+    def test_pi_package_stages_extensions_and_the_shared_worker_policy(self):
+        with tempfile.TemporaryDirectory(prefix="delm pi build ") as temporary:
+            source = fixture_source(Path(temporary) / "source")
+            (source / "hosts/pi/notes.txt").write_text("never package this")
+            runtime = Path(temporary) / "runtime"
+            fixture_runtime(runtime)
+            with contextlib.redirect_stdout(io.StringIO()):
+                build.build(source, runtime, host="pi")
+            package = source / ".build/plugin-pi"
+            self.assertEqual(set(install_support.package_files(package)), {*build.PI_PACKAGE_FILES, "bin/delm"})
+            self.assertEqual((package / "worker.md").read_bytes(), (source / "plugin/worker.md").read_bytes())
+            manifest = json.loads((package / "package.json").read_text())
+            self.assertEqual(manifest["pi"]["extensions"], ["./extensions/delm.ts", "./extensions/delm-worker.ts"])
+            (source / "hosts/pi/package.json").write_text(json.dumps({"name": "delm-pi", "pi": {"extensions": ["./extensions/delm.ts"]}}))
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaisesRegex(RuntimeError, "exactly the two DeLM extensions"):
+                build.build(source, runtime, host="pi")
 
     def test_old_same_version_runtime_cannot_activate_claude_package(self):
         with tempfile.TemporaryDirectory() as temporary:
