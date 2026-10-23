@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {commandOutcome, coordinationTool, decodeLines, launchPrompt, toolArguments, turnReason, updateText, validateReady}
+import {commandOutcome, coordinationTool, decodeLines, explainModelError, launchPrompt, toolArguments, turnReason, updateText, validateReady}
   from '../lib/protocol.ts';
 
 const ready = {
@@ -56,4 +56,13 @@ test('updates are bounded and the launch prompt carries the request', () => {
   assert.throws(() => updateText('x'.repeat(128 * 1024 + 1)));
   assert.match(updateText('fix it', ['see README']), /Additional context:\nsee README$/);
   assert.match(launchPrompt('Build a thing', 2), /peer 2 of 2[\s\S]*User request:\nBuild a thing$/);
+});
+
+test('model refusals are explained with the fix, not the raw API body', () => {
+  const quota = explainModelError('400 {"type":"error","error":{"type":"invalid_request_error","message":"You\'re out of extra usage. Add more at claude.ai/settings/usage and keep going."},"request_id":"req_1"}');
+  assert.match(quota, /no extra usage left/);
+  assert.match(quota, /API key/);
+  assert.match(explainModelError('401 {"error":{"message":"invalid x-api-key"}}'), /rejected the login/);
+  assert.match(explainModelError('429 rate_limit_error: too many requests'), /rate limiting/);
+  assert.match(explainModelError('something odd happened'), /provider returned: something odd happened/);
 });

@@ -9,10 +9,11 @@ import {tmpdir} from 'node:os';
 import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
+import {execFile} from 'node:child_process';
 import {PiProcess, type RpcEvent} from '../lib/rpc.ts';
 import {TicketServer, bridgeRoot, type TicketRequest, type ReleaseRequest} from '../lib/bridge.ts';
 import {request, startBridge, type Action, type Bridge} from '../lib/control.ts';
-import {commandOutcome, hostNotes, launchPrompt, turnReason, updateText} from '../lib/protocol.ts';
+import {commandOutcome, explainModelError, hostNotes, launchPrompt, turnReason, updateText} from '../lib/protocol.ts';
 
 type Worker = {
   slot: number;
@@ -29,6 +30,7 @@ type Worker = {
 type Run = {
   sessionId: string;
   log: (line: string) => void;
+  modelErrorReported: boolean;
   task: string;
   bridge: Bridge;
   revision: number;
@@ -128,14 +130,16 @@ export default function (pi: ExtensionAPI) {
         status(undefined);
         const outcome = String(action.status);
         const delivered = outcome === 'complete' || outcome === 'delivered';
-        notify(delivered ? 'DeLM delivered the result into your project.'
-          : 'DeLM: ' + outcome.replaceAll('_', ' ') + (run.failure ? '. ' + run.failure : '') + '. Log: ' + join(run.sessionDir, 'delm-pi.log'),
-          delivered ? 'info' : 'warning');
+        if (delivered) notify('DeLM delivered the result into your project.');
+        else if (run.modelErrorReported) notify('DeLM stopped without changing your project. Fix the model access above, then run /delm:run again.', 'warning');
+        else notify('DeLM ' + outcome.replaceAll('_', ' ') + (run.failure ? ': ' + run.failure : '') + '. Worker log: ' + join(run.sessionDir, 'delm-pi.log'), 'warning');
         const verification = (action.delivery as {verification_required?: boolean} | undefined)?.verification_required
           ? 'The delivery requires a focused check in the original project. Perform only the necessary environment setup and checks for the delivered or reconciled files, then state the outcome.'
           : 'Do not run another verification pass or edit files.';
-        pi.sendUserMessage('DeLM completed its handoff. Report this result concisely, using the original project path. '
-          + verification + '\nNative runtime result:\n' + JSON.stringify(action));
+        if (delivered) {
+          pi.sendUserMessage('DeLM completed its handoff. Report this result concisely, using the original project path. '
+            + verification + '\nNative runtime result:\n' + JSON.stringify(action));
+        }
         await cleanup();
         return;
       }
@@ -171,8 +175,7 @@ export default function (pi: ExtensionAPI) {
           const message = event.message as {role?: string; stopReason?: string; errorMessage?: string} | undefined;
           if (message?.role === 'assistant' && message.stopReason === 'error') {
             target.lastError = String(message.errorMessage || 'the model returned an error');
-            run.failure = 'peer ' + target.slot + ': ' + target.lastError;
-            notify('DeLM peer ' + target.slot + ' hit a model error: ' + target.lastError.slice(0, 200), 'error');
+            await stopForModelError(target, target.lastError);
           }
           return;
         }
@@ -227,6 +230,23 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // The workers use the same provider login as this session, so a refusal is
+  // almost always about the account, not the task. Stop before the controller
+  // spends resumes on empty turns, and tell the user what to change.
+  async function stopForModelError(target: Worker, error: string) {
+    if (!run || run.finished || run.finalization || run.modelErrorReported) return;
+    run.modelErrorReported = true;
+    run.failure = explainModelError(error);
+    notify('DeLM stopped: peer ' + target.slot + '\'s model request was rejected. ' + run.failure
+      + ' Nothing in your project was changed.', 'error');
+    try {
+      const cancelled = await control('cancel', {reason: 'Peer model error'});
+      await applyActions((cancelled.actions as Action[]) || []);
+    } catch (cancelError) {
+      notify('DeLM could not stop cleanly: ' + String((cancelError as Error).message || cancelError), 'error');
+    }
+  }
+
   async function onWorkerExit(target: Worker) {
     if (!run || run.finished) return;
     if (target.status === 'running') target.status = run.finalization ? 'killed' : 'failed';
@@ -242,8 +262,25 @@ export default function (pi: ExtensionAPI) {
 
   // ---- launch ----------------------------------------------------------------
 
+  // `pi auth check` refreshes and validates the provider login the workers will
+  // inherit. It cannot see usage quotas; those surface on the first request.
+  function checkLogin(model: {provider: string; id: string} | null): Promise<void> {
+    if (!model) return Promise.reject(new Error('No model is selected in this Pi session. Choose one with /model, then run /delm:run again.'));
+    return new Promise((resolve, reject) => {
+      execFile(process.env.DELM_PI_COMMAND || 'pi', ['auth', 'check', '--provider', model.provider, '--model', model.id, '--json'],
+        {timeout: 30000, env: process.env}, (error, stdout, stderr) => {
+          if (!error) return resolve();
+          if (process.env.DELM_PI_COMMAND) return resolve();   // a scripted host has no login
+          const detail = String(stdout || stderr || error.message).trim().replace(/\s+/g, ' ').slice(0, 300);
+          reject(new Error('Pi has no working login for ' + model.provider + '/' + model.id + ' (' + detail + '). Run /login in Pi, then /delm:run again.'));
+        });
+    });
+  }
+
   async function launch(ctx: ExtensionContext, task: string) {
     const executable = runtimeExecutable();
+    const selected = ctx.model ? {provider: (ctx.model as {provider: string}).provider, id: (ctx.model as {id: string}).id} : null;
+    await checkLogin(selected);
     const sessionId = ctx.sessionManager.getSessionId();
     const parentFile = ctx.sessionManager.getSessionFile();
     const bridge = await startBridge(executable, {
@@ -256,12 +293,13 @@ export default function (pi: ExtensionAPI) {
     run = {
       sessionId, task, bridge, revision: bridge.ready.revision, workers: [], tickets: [], finalization: null,
       settling: null, finished: false, final: null, lastAction: null, failure: null, stopRequested: false, sessionDir, log,
+      modelErrorReported: false,
     };
     log('run ' + bridge.ready.run_id + ' project ' + ctx.cwd + ' sessions ' + sessionDir);
     void bridge.exited.then(() => { if (run && !run.finished) { run.failure = 'DeLM runtime exited.'; status('DeLM: runtime exited'); } });
     const policyFile = join(sessionDir, 'worker-policy.md');
     writeFileSync(policyFile, workerPolicy(), {mode: 0o600});
-    const model = ctx.model ? `${(ctx.model as {provider: string}).provider}/${(ctx.model as {id: string}).id}` : null;
+    const model = selected ? `${selected.provider}/${selected.id}` : null;
     const thinking = pi.getThinkingLevel();
     const root = bridgeRoot();
     try {
@@ -403,7 +441,7 @@ export default function (pi: ExtensionAPI) {
         await launch(ctx, task);
         ctx.ui.notify('DeLM started two peers in private copies of this project. Send text here to update the task; /delm:stop cancels.', 'info');
       } catch (error) {
-        ctx.ui.notify('DeLM could not start: ' + String((error as Error).message || error), 'error');
+        ctx.ui.notify('DeLM could not start: ' + String((error as Error).message || error).replace(/^Error:\s*/, ''), 'error');
       }
     },
   });

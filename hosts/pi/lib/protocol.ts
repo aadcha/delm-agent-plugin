@@ -114,3 +114,32 @@ export function updateText(text: string, extra: string[] = []): string {
 export function completeState(status: string): boolean {
   return ['completed', 'failed', 'killed', 'finished'].includes(status);
 }
+
+// Provider refusals come back as raw API JSON. Name the cause and the fix in
+// one sentence; the raw text stays available in the worker log.
+export function explainModelError(raw: string): string {
+  let message = raw;
+  const json = raw.match(/\{[\s\S]*\}/);
+  if (json) {
+    try {
+      const parsed = JSON.parse(json[0]) as {error?: {message?: string; type?: string}; message?: string};
+      message = parsed.error?.message || parsed.message || raw;
+    } catch { /* not JSON */ }
+  }
+  const text = message.trim().replace(/\s+/g, ' ');
+  const whole = raw.replace(/\s+/g, ' ');
+  if (/out of extra usage/i.test(whole)) {
+    return 'Your Anthropic subscription login has no extra usage left, and Pi bills third-party harness use against extra usage. '
+      + 'Add extra usage at claude.ai/settings/usage, or run /login in Pi and sign in with an API key instead.';
+  }
+  if (/\b401\b|authentication|invalid[ -_]?(x-)?api[ -_]?key|unauthorized|token expired|not logged in/i.test(whole)) {
+    return 'The provider rejected the login (' + text.slice(0, 160) + '). Run /login in Pi to refresh it.';
+  }
+  if (/\b429\b|rate[ _]limit|overloaded|\b529\b/i.test(whole)) {
+    return 'The provider is rate limiting or overloaded (' + text.slice(0, 160) + '). Wait a minute and run /delm:run again.';
+  }
+  if (/model not found|does not exist|unsupported model|\b404\b/i.test(whole)) {
+    return 'The provider does not offer this session\'s model to the workers (' + text.slice(0, 160) + '). Pick another model with /model and run /delm:run again.';
+  }
+  return 'The provider returned: ' + text.slice(0, 300);
+}
