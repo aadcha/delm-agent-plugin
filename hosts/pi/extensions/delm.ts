@@ -369,8 +369,12 @@ export default function (pi: ExtensionAPI) {
           deliveredRevision: bridge.ready.revision, pendingUpdate: null, status: 'running', stopPromise: null, lastError: null,
         };
         run.workers.push(target);
+        let deltas = 0;
         child.onEvent(event => {
-          if (!['message_update', 'tool_execution_update'].includes(event.type)) {
+          if (event.type === 'message_update') {
+            // A heartbeat every 200 stream deltas shows a long response is still flowing.
+            if (++deltas % 200 === 0) run?.log('worker ' + slot + ' streaming: ' + deltas + ' deltas');
+          } else if (event.type !== 'tool_execution_update') {
             run?.log('worker ' + slot + ' ' + JSON.stringify(event).slice(0, 2000));
           }
           void onWorkerEvent(target, event);
