@@ -414,10 +414,10 @@ export default function (pi: ExtensionAPI) {
 
   const BOARD_WIDTH = 100;
 
-  function paintBoard() {
-    if (!run || !ctxRef?.hasUI) return;
-    if (run.boardHidden || !run.view) { try { ctxRef.ui.setWidget('delm-board', undefined); } catch { /* no UI */ } return; }
-    try { ctxRef.ui.setWidget('delm-board', renderBoard(run.view, BOARD_WIDTH)); } catch { /* no UI */ }
+  function paintBoard(target: Run | null = run || lastFinished) {
+    if (!target || !ctxRef?.hasUI) return;
+    if (target.boardHidden || !target.view) { try { ctxRef.ui.setWidget('delm-board', undefined); } catch { /* no UI */ } return; }
+    try { ctxRef.ui.setWidget('delm-board', renderBoard(target.view, BOARD_WIDTH)); } catch { /* no UI */ }
   }
 
   function startBoard(ctx: ExtensionContext) {
@@ -426,9 +426,10 @@ export default function (pi: ExtensionAPI) {
     const observer = new BoardObserver(runtimeExecutable(), current.bridge.ready.run_id, current.sessionId);
     current.observer = observer;
     observer.start(view => {
-      if (run !== current && !(current.finished && run === null)) return;
+      // The final snapshot lands after the run record is released; it still belongs on screen.
+      if (run !== current && lastFinished !== current) return;
       current.view = view;
-      if (run === current) paintBoard();
+      paintBoard(current);
     }, message => current.log('board observer: ' + message));
   }
 
