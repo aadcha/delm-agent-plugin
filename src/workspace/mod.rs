@@ -333,6 +333,15 @@ fn names(dir: &File) -> Result<Vec<OsString>> {
     Ok(result)
 }
 
+/// macOS attaches `com.apple.provenance` to every file a provenance-tagged
+/// process creates or clones, including the runtime's own baseline copies, so a
+/// project whose files lack it would always appear changed during capture. It
+/// is system bookkeeping about the writing process, not project content, and
+/// is never delivered or compared.
+pub(crate) fn system_managed_attribute(name: &[u8]) -> bool {
+    name == b"com.apple.provenance"
+}
+
 #[cfg(target_os = "macos")]
 fn attributes(file: &File) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
     let fd = file.as_raw_fd();
@@ -353,7 +362,10 @@ fn attributes(file: &File) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
         "extended attributes changed during inspection"
     );
     let mut result = BTreeMap::new();
-    for name in list.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+    for name in list
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty() && !system_managed_attribute(s))
+    {
         let cname = CString::new(name)?;
         let size = unsafe { libc::fgetxattr(fd, cname.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
         ensure!(
