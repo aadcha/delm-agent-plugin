@@ -90,7 +90,7 @@ export function hostNotes(): string {
   return [
     'Pi host instructions for DeLM:',
     '- The shared board tools are named ' + TOOL_PREFIX + '<tool>, for example ' + TOOL_PREFIX + 'delm_publish. The policy refers to them by the short name.',
-    '- Run checks through the bash tool. Each bash call\'s tool call id is its native command id; recent_commands in board responses lists the ids the runtime observed.',
+    '- Run checks through the bash tool. Each bash call\'s tool call id (toolu_...) is its native command id. For delm_check_finish and the checks list of delm_complete, copy the full id exactly as recent_commands shows it in board responses; never shorten or guess an id.',
     '- Never supply the _delm field on a board tool; the host binds it.',
     '- After calling delm_complete, finish your reply and end the turn. The runtime resumes you when shared work changes or when the user updates the request.',
     '- Work only inside your current working directory, which is your private copy of the project.',

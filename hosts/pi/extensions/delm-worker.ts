@@ -16,6 +16,19 @@ export default function (pi: ExtensionAPI) {
   }
 
   const tickets = new Map<string, string>();
+  // Bash call ids this worker has made, newest last. A model sometimes cites
+  // a shortened id; an unambiguous prefix is completed before the call is
+  // bound, so the runtime still matches it to the observed command.
+  const bashCalls: string[] = [];
+  const complete = (value: unknown): unknown => {
+    if (typeof value !== 'string' || !value || bashCalls.includes(value)) return value;
+    const matches = bashCalls.filter(id => id.startsWith(value));
+    return matches.length === 1 ? matches[0] : value;
+  };
+  const completeCommandIds = (tool: string, args: Record<string, unknown>) => {
+    if (tool === 'delm_check_finish' && 'command_id' in args) args.command_id = complete(args.command_id);
+    if (tool === 'delm_complete' && Array.isArray(args.checks)) args.checks = args.checks.map(complete);
+  };
 
   pi.on('session_start', async () => {
     // The sidecar executes a board call only with a ticket the parent reserved.
@@ -29,10 +42,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on('tool_call', async event => {
+    if (event.toolName === 'bash') { bashCalls.push(event.toolCallId); if (bashCalls.length > 256) bashCalls.shift(); return undefined; }
     const tool = coordinationTool(event.toolName);
     if (!tool) return undefined;
     const input = event.input as Record<string, unknown>;
     const arguments_ = toolArguments(input);
+    completeCommandIds(tool, arguments_);
     let reply;
     try {
       reply = await requestTicket(bridge, {call_id: event.toolCallId, tool, arguments: arguments_});
