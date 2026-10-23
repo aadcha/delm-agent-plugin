@@ -4,7 +4,7 @@
 // user's updates, and reports the delivered result.
 import type {ExtensionAPI, ExtensionContext} from '@earendil-works/pi-coding-agent';
 import {SessionManager} from '@earendil-works/pi-coding-agent';
-import {mkdirSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
+import {appendFileSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -23,10 +23,12 @@ type Worker = {
   pendingUpdate: {revision: number; message: string} | null;
   status: 'running' | 'completed' | 'failed' | 'killed';
   stopPromise: Promise<unknown> | null;
+  lastError: string | null;
 };
 
 type Run = {
   sessionId: string;
+  log: (line: string) => void;
   task: string;
   bridge: Bridge;
   revision: number;
@@ -126,7 +128,8 @@ export default function (pi: ExtensionAPI) {
         status(undefined);
         const outcome = String(action.status);
         const delivered = outcome === 'complete' || outcome === 'delivered';
-        notify(delivered ? 'DeLM delivered the result into your project.' : 'DeLM: ' + outcome.replaceAll('_', ' '),
+        notify(delivered ? 'DeLM delivered the result into your project.'
+          : 'DeLM: ' + outcome.replaceAll('_', ' ') + (run.failure ? '. ' + run.failure : '') + '. Log: ' + join(run.sessionDir, 'delm-pi.log'),
           delivered ? 'info' : 'warning');
         const verification = (action.delivery as {verification_required?: boolean} | undefined)?.verification_required
           ? 'The delivery requires a focused check in the original project. Perform only the necessary environment setup and checks for the delivered or reconciled files, then state the outcome.'
@@ -164,6 +167,15 @@ export default function (pi: ExtensionAPI) {
     if (!run || run.finished) return;
     try {
       switch (event.type) {
+        case 'message_end': {
+          const message = event.message as {role?: string; stopReason?: string; errorMessage?: string} | undefined;
+          if (message?.role === 'assistant' && message.stopReason === 'error') {
+            target.lastError = String(message.errorMessage || 'the model returned an error');
+            run.failure = 'peer ' + target.slot + ': ' + target.lastError;
+            notify('DeLM peer ' + target.slot + ' hit a model error: ' + target.lastError.slice(0, 200), 'error');
+          }
+          return;
+        }
         case 'agent_start': {
           target.turn = randomUUID();
           await control('step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
@@ -193,7 +205,8 @@ export default function (pi: ExtensionAPI) {
           const turn = target.turn;
           target.turn = null;
           const answer = (await target.process.lastAssistantText().catch(() => null)) || '';
-          const reason = turnReason(event as {aborted?: boolean}, !target.process.running);
+          const reason = target.lastError && !answer ? 'failed' : turnReason(event as {aborted?: boolean}, !target.process.running);
+          target.lastError = null;
           const result = await control('turn_end', {agent_id: target.agentId, turn_id: turn, reason, answer});
           await applyActions((result.actions as Action[]) || []);
           if (target.pendingUpdate && reason === 'completed' && !run.finalization && target.process.running) {
@@ -238,10 +251,13 @@ export default function (pi: ExtensionAPI) {
     }, actions => { void applyActions(actions); });
     if (bridge.ready.session_id !== sessionId) throw new Error('DeLM returned workspaces for another conversation.');
     const sessionDir = mkdtempSync(join(tmpdir(), 'delm-pi-sessions-'));
+    const logFile = join(sessionDir, 'delm-pi.log');
+    const log = (line: string) => { try { appendFileSync(logFile, new Date().toISOString() + ' ' + line + '\n'); } catch { /* Diagnostics only. */ } };
     run = {
       sessionId, task, bridge, revision: bridge.ready.revision, workers: [], tickets: [], finalization: null,
-      settling: null, finished: false, final: null, lastAction: null, failure: null, stopRequested: false, sessionDir,
+      settling: null, finished: false, final: null, lastAction: null, failure: null, stopRequested: false, sessionDir, log,
     };
+    log('run ' + bridge.ready.run_id + ' project ' + ctx.cwd + ' sessions ' + sessionDir);
     void bridge.exited.then(() => { if (run && !run.finished) { run.failure = 'DeLM runtime exited.'; status('DeLM: runtime exited'); } });
     const policyFile = join(sessionDir, 'worker-policy.md');
     writeFileSync(policyFile, workerPolicy(), {mode: 0o600});
@@ -273,10 +289,16 @@ export default function (pi: ExtensionAPI) {
         });
         const target: Worker = {
           slot, agentId: 'pi-' + slot + '-' + child.pid, process: child, turn: null,
-          deliveredRevision: bridge.ready.revision, pendingUpdate: null, status: 'running', stopPromise: null,
+          deliveredRevision: bridge.ready.revision, pendingUpdate: null, status: 'running', stopPromise: null, lastError: null,
         };
         run.workers.push(target);
-        child.onEvent(event => { void onWorkerEvent(target, event); });
+        child.onEvent(event => {
+          if (!['message_update', 'tool_execution_update'].includes(event.type)) {
+            run?.log('worker ' + slot + ' ' + JSON.stringify(event).slice(0, 2000));
+          }
+          void onWorkerEvent(target, event);
+        });
+        run.log('worker ' + slot + ' pid ' + child.pid + ' args ' + JSON.stringify(args));
         void child.exited.then(() => onWorkerExit(target));
         await control('bind', {slot, agent_id: target.agentId});
         await control('configure_scopes', {agent_id: target.agentId, scopes: [{path: cwd, access: 'write'}]});
@@ -330,11 +352,12 @@ export default function (pi: ExtensionAPI) {
   async function settle() {
     if (!run || run.finished || !run.finalization) return;
     if (run.settling) return run.settling;
-    const fence = {...run.finalization};
-    run.settling = (async () => {
+    const current = run;
+    const fence = {...current.finalization};
+    current.settling = (async () => {
       try {
         const begun = await control('begin_settle', {generation: fence.generation, revision: fence.revision});
-        if (run!.stopRequested && (begun.finalization as {intent?: string})?.intent !== 'cancel') {
+        if (current.stopRequested && (begun.finalization as {intent?: string})?.intent !== 'cancel') {
           const cancelled = await control('cancel', {reason: 'User requested /delm-stop'});
           await applyActions((cancelled.actions as Action[]) || []);
           return;
@@ -345,12 +368,14 @@ export default function (pi: ExtensionAPI) {
         });
         await applyActions((final.actions as Action[]) || []);
       } catch (error) {
-        try { await control('settlement_failed', {generation: fence.generation, revision: fence.revision}); } catch { /* Recovery. */ }
-        run!.failure = String((error as Error).message || error);
-        notify('DeLM: ' + run!.failure + ' Private workspaces are preserved for recovery.', 'error');
+        if (!current.finished) {
+          try { await control('settlement_failed', {generation: fence.generation, revision: fence.revision}); } catch { /* Recovery. */ }
+        }
+        current.failure = String((error as Error).message || error);
+        notify('DeLM: ' + current.failure + ' Private workspaces are preserved for recovery.', 'error');
       }
     })();
-    try { await run.settling; } finally { if (run) run.settling = null; }
+    try { await current.settling; } finally { current.settling = null; }
   }
 
   async function cleanup() {
