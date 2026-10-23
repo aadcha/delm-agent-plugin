@@ -97,10 +97,15 @@ customization of the parent session.
 
 ## Status
 
-Exercised so far, all without a model:
+Exercised so far:
 
 - the parent extension loads under Pi 1.2.0 in RPC mode, `/delm:run`, `/delm:status` and `/delm:stop` register, and a command typed as an RPC prompt reaches its handler;
 - the worker extension registers the DeLM MCP server with direct exposure, and all fifteen `mcp__delm__*` tools appear in the worker's tool list;
 - the lifecycle fixture (`hosts/pi/tests/lifecycle.test.mjs`) runs the real parent extension, controller, sidecar and delivery with two scripted workers: one runs a real bash command, cites it as a check, and completes; the result is delivered into the original project with unrelated files intact.
 
-Not exercised yet: a real model run, follow-up updates and steering, a parent restart with recovery, forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.
+- one real run on Pi 1.2.0 with `anthropic/claude-opus-4-8` (2026-10-22): two workers forked from the
+  session, one implemented `hello.py` and `test_hello.py`, ran pytest through a check receipt (exit 0),
+  published and completed; the other read the board and stood down; delivery into the original project
+  completed with no conflicts and both worker trees removed, about 70 seconds end to end.
+
+Not exercised yet: follow-up updates and steering, a parent restart with recovery, forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.
