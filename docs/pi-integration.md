@@ -79,6 +79,23 @@ adapter records `CommandCompletion::NativeProcess` with that exit code under `Na
 Background or interrupted commands (a thrown abort or timeout) produce no `tool_execution_end`
 result with an exit code and do not qualify as completed checks.
 
+### The board
+
+`/delm:run` opens a live board above the editor: phase, both agents with their state and claimed task,
+the task queue, the latest shared contribution and the recorded-check count, and the outcome when the
+run ends. It is rendered from the passive observer (`delm pi view --watch`), which reads the run records
+without touching the controller. `/delm:board hide` hides it for the run, `/delm:status` or `/delm:board`
+reopens it, and `/delm:board tasks|shared|checks` opens a scrollable detail overlay (Esc closes). The
+final state stays visible until hidden or until the next run starts.
+
+### Recovery
+
+If the Pi session ends while a run is active, the workers and bridge exit with it and the run record
+keeps the project locked. The next session in that project is told so at start; `/delm:recover`
+confirms through the controller's tokenless path that the old bridge and host have exited, saves the
+unfinished changes under the run's `workspace/recovery`, removes the worker trees and releases the
+project.
+
 ### Updates, completion, shutdown
 
 A follow-up `/delm run` while a run is active, or plain text sent while the run owns input, is
@@ -108,4 +125,8 @@ Exercised so far:
   published and completed; the other read the board and stood down; delivery into the original project
   completed with no conflicts and both worker trees removed, about 70 seconds end to end.
 
-Not exercised yet: follow-up updates and steering, a parent restart with recovery, forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.
+- `hosts/pi/tests/live-lifecycle.mjs` drives the installed Pi in RPC mode with a real model through
+  three scenarios: a typed update mid-run, `/delm:stop`, and a killed session followed by
+  `/delm:recover`. It bills the provider login and is run explicitly, not by `npm test`.
+
+Not exercised yet: steering an actively streaming worker from the UI, a parent restart with recovery, forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.

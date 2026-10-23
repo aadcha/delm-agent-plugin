@@ -14,6 +14,9 @@ import {PiProcess, type RpcEvent} from '../lib/rpc.ts';
 import {TicketServer, bridgeRoot, type TicketRequest, type ReleaseRequest} from '../lib/bridge.ts';
 import {request, startBridge, type Action, type Bridge} from '../lib/control.ts';
 import {commandOutcome, explainModelError, hostNotes, launchPrompt, turnReason, updateText} from '../lib/protocol.ts';
+import {BoardObserver, fetchCollection, renderBoard, renderCollection, type View} from '../lib/board.ts';
+import {existsSync, readdirSync} from 'node:fs';
+import {homedir} from 'node:os';
 
 type Worker = {
   slot: number;
@@ -31,6 +34,9 @@ type Run = {
   sessionId: string;
   log: (line: string) => void;
   modelErrorReported: boolean;
+  observer: BoardObserver | null;
+  view: View | null;
+  boardHidden: boolean;
   task: string;
   bridge: Bridge;
   revision: number;
@@ -61,6 +67,7 @@ export default function (pi: ExtensionAPI) {
   if (process.env.DELM_PI_WORKER) return;   // A worker never starts a nested run.
 
   let run: Run | null = null;
+  let lastFinished: Run | null = null;
   let ctxRef: ExtensionContext | null = null;
 
   const notify = (message: string, level: 'info' | 'warning' | 'error' = 'info') => {
@@ -290,6 +297,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function launch(ctx: ExtensionContext, task: string) {
+    if (lastFinished) { stopBoard(lastFinished); lastFinished = null; try { ctx.ui.setWidget('delm-board', undefined); } catch { /* no UI */ } }
     const executable = runtimeExecutable();
     const selected = ctx.model ? {provider: (ctx.model as {provider: string}).provider, id: (ctx.model as {id: string}).id} : null;
     await checkLogin(selected);
@@ -305,8 +313,9 @@ export default function (pi: ExtensionAPI) {
     run = {
       sessionId, task, bridge, revision: bridge.ready.revision, workers: [], tickets: [], finalization: null,
       settling: null, finished: false, final: null, lastAction: null, failure: null, stopRequested: false, sessionDir, log,
-      modelErrorReported: false,
+      modelErrorReported: false, observer: null, view: null, boardHidden: false,
     };
+    startBoard(ctx);
     log('run ' + bridge.ready.run_id + ' project ' + ctx.cwd + ' sessions ' + sessionDir);
     void bridge.exited.then(() => { if (run && !run.finished) { run.failure = 'DeLM runtime exited.'; status('DeLM: runtime exited'); } });
     const policyFile = join(sessionDir, 'worker-policy.md');
@@ -379,6 +388,60 @@ export default function (pi: ExtensionAPI) {
     return {socket: run.bridge.ready.socket, ticket: reservation.ticket};
   }
 
+  // ---- the live board ----------------------------------------------------------
+
+  const BOARD_WIDTH = 100;
+
+  function paintBoard() {
+    if (!run || !ctxRef?.hasUI) return;
+    if (run.boardHidden || !run.view) { try { ctxRef.ui.setWidget('delm-board', undefined); } catch { /* no UI */ } return; }
+    try { ctxRef.ui.setWidget('delm-board', renderBoard(run.view, BOARD_WIDTH)); } catch { /* no UI */ }
+  }
+
+  function startBoard(ctx: ExtensionContext) {
+    if (!run || !ctx.hasUI) return;
+    const current = run;
+    const observer = new BoardObserver(runtimeExecutable(), current.bridge.ready.run_id, current.sessionId);
+    current.observer = observer;
+    observer.start(view => {
+      if (run !== current && !(current.finished && run === null)) return;
+      current.view = view;
+      if (run === current) paintBoard();
+    }, message => current.log('board observer: ' + message));
+  }
+
+  function stopBoard(target: Run) {
+    target.observer?.stop();
+    target.observer = null;
+  }
+
+  async function showCollection(ctx: ExtensionContext, kind: 'tasks' | 'shared' | 'checks') {
+    if (!run) { ctx.ui.notify('No DeLM run in this session.', 'info'); return; }
+    let view: View;
+    try { view = await fetchCollection(runtimeExecutable(), run.bridge.ready.run_id, run.sessionId, kind); }
+    catch (error) { ctx.ui.notify('DeLM board detail unavailable: ' + String((error as Error).message || error), 'warning'); return; }
+    const lines = renderCollection(view, kind, BOARD_WIDTH);
+    await ctx.ui.custom<void>((tui, _theme, _keys, done) => {
+      let offset = 0;
+      const component = {
+        render(width: number) {
+          const height = Math.max(5, Math.min(lines.length, 30));
+          const page = lines.slice(offset, offset + height).map(line => ' ' + line.slice(0, Math.max(0, width - 2)));
+          while (page.length < height) page.push('');
+          return page;
+        },
+        invalidate() { /* nothing cached */ },
+        handleInput(data: string) {
+          if (data === '\x1b' || data === 'q' || data === '\r' || data === '\n') { done(); return; }
+          if (data === '\x1b[B' || data === 'j') offset = Math.min(Math.max(0, lines.length - 5), offset + 1);
+          if (data === '\x1b[A' || data === 'k') offset = Math.max(0, offset - 1);
+          tui.requestRender();
+        },
+      };
+      return component as never;
+    }, {overlay: true, overlayOptions: {width: '80%', maxHeight: '80%', anchor: 'center' as never}});
+  }
+
   // ---- shutdown and settlement -------------------------------------------------
 
   async function stopWorkers(): Promise<{id: string; status: string}[]> {
@@ -430,10 +493,11 @@ export default function (pi: ExtensionAPI) {
 
   async function cleanup() {
     if (!run) return;
+    // The board observer exits by itself once the run record is finished.
     for (const tickets of run.tickets) { try { await tickets.close(); } catch { /* Already closed. */ } }
     for (const target of run.workers) { if (target.process.running) void target.process.stop(1000); }
     status(undefined);
-    if (run.finished) run = null;
+    if (run.finished) { lastFinished = run; run = null; }
   }
 
   // ---- commands and input ----------------------------------------------------
@@ -473,22 +537,90 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // /delm:status reopens the board, as in Claude Code; without a run it says so briefly.
   pi.registerCommand('delm:status', {
-    description: 'Show the active DeLM run',
+    description: 'Show the DeLM board for this session',
     handler: async (_args, ctx) => {
       ctxRef = ctx;
-      if (!run) { ctx.ui.notify('No DeLM run in this session.', 'info'); return; }
-      if (run.finished) { ctx.ui.notify('DeLM finished: ' + String(run.final?.status), 'info'); return; }
+      const target = run || lastFinished;
+      if (!target) { ctx.ui.notify('No DeLM run in this session.', 'info'); return; }
+      target.boardHidden = false;
+      if (!ctx.hasUI) {
+        ctx.ui.notify('DeLM ' + (target.view ? target.view.status : target.finished ? String(target.final?.status) : 'running')
+          + (target.failure ? '. ' + target.failure : ''), 'info');
+        return;
+      }
+      if (target.view) ctx.ui.setWidget('delm-board', renderBoard(target.view, BOARD_WIDTH));
+      else ctx.ui.notify('DeLM board is loading.', 'info');
+    },
+  });
+
+  pi.registerCommand('delm:board', {
+    description: 'DeLM board: show, hide, or open tasks, shared or checks',
+    handler: async (args, ctx) => {
+      ctxRef = ctx;
+      const word = (args || '').trim().toLowerCase();
+      const target = run || lastFinished;
+      if (!target) { ctx.ui.notify('No DeLM run in this session.', 'info'); return; }
+      if (word === 'hide') { target.boardHidden = true; try { ctx.ui.setWidget('delm-board', undefined); } catch { /* no UI */ } return; }
+      if (word === 'tasks' || word === 'shared' || word === 'checks') { await showCollection(ctx, word); return; }
+      target.boardHidden = false;
+      if (target.view) ctx.ui.setWidget('delm-board', renderBoard(target.view, BOARD_WIDTH));
+      else ctx.ui.notify('DeLM board is loading.', 'info');
+    },
+  });
+
+  // Recovery of a run whose session ended before it finished: the bridge is
+  // gone, so the controller's tokenless path confirms the host exited and
+  // saves the unfinished changes, releasing the project for a new run.
+  function unfinishedRuns(project: string): {id: string; status: string}[] {
+    const root = join(homedir(), 'Library', 'Application Support', 'DeLM', 'runs');
+    if (!existsSync(root)) return [];
+    const found: {id: string; status: string}[] = [];
+    for (const id of readdirSync(root)) {
       try {
-        const live = await control('status', {}, 5000);
-        const board = live.board as {tasks?: unknown[]} | undefined;
-        ctx.ui.notify('DeLM ' + String((live.run as {status?: string})?.status) + ', revision ' + run.revision
-          + ', ' + run.workers.filter(w => w.turn).length + ' peers active, '
-          + ((board?.tasks as unknown[] | undefined)?.length ?? 0) + ' tasks' + (run.failure ? '. Last error: ' + run.failure : ''), 'info');
-      } catch (error) {
-        ctx.ui.notify('DeLM status unavailable: ' + String((error as Error).message || error), 'warning');
+        const saved = JSON.parse(readFileSync(join(root, id, 'claude.json'), 'utf8')) as {host?: string; project?: string; finished?: boolean; status?: string};
+        if (saved.host === 'pi' && !saved.finished && saved.project && [project, resolve(project)].includes(saved.project)) {
+          found.push({id, status: String(saved.status)});
+        }
+      } catch { /* not a run record */ }
+    }
+    return found;
+  }
+
+  pi.registerCommand('delm:recover', {
+    description: 'Save the changes of an unfinished DeLM run that owns this project',
+    handler: async (_args, ctx) => {
+      ctxRef = ctx;
+      if (run && !run.finished) { ctx.ui.notify('A DeLM run is active here; use /delm:stop first.', 'warning'); return; }
+      const stale = unfinishedRuns(ctx.cwd);
+      if (!stale.length) { ctx.ui.notify('No unfinished DeLM run owns this project.', 'info'); return; }
+      for (const item of stale) {
+        await new Promise<void>(done => {
+          const child = execFile(runtimeExecutable(), ['pi', 'recover', '--run-id', item.id], {timeout: 120000}, (error, stdout, stderr) => {
+            if (error) ctx.ui.notify('DeLM could not recover run ' + item.id.slice(0, 8) + ': ' + String(stderr || error.message).trim().slice(0, 300), 'error');
+            else {
+              let result: {status?: string; recovery?: {recovery?: string}} = {};
+              try { result = JSON.parse(String(stdout).trim().split('\n').at(-1) || '{}'); } catch { /* raw */ }
+              ctx.ui.notify('DeLM run ' + item.id.slice(0, 8) + ' recovered: ' + String(result.status || 'done')
+                + (result.recovery?.recovery ? '. Saved changes: ' + result.recovery.recovery : ''), 'info');
+            }
+            done();
+          });
+          child.stdin?.end('{}\n');
+        });
       }
     },
+  });
+
+  pi.on('session_start', async (_event, ctx) => {
+    ctxRef = ctx;
+    if (process.env.DELM_PI_COMMAND) return;   // scripted hosts do not look at private storage
+    const stale = unfinishedRuns(ctx.cwd);
+    if (stale.length) {
+      ctx.ui.notify('An unfinished DeLM run owns this project (' + stale.map(item => item.id.slice(0, 8) + ' ' + item.status).join(', ')
+        + '). Run /delm:recover to save its changes before starting another.', 'warning');
+    }
   });
 
   async function forward(text: string) {
@@ -503,7 +635,7 @@ export default function (pi: ExtensionAPI) {
 
   // While a run is working, ordinary text goes to the peers, not to the parent model.
   pi.on('input', async event => {
-    if (!run || run.finished || run.finalization || event.source !== 'interactive') return {action: 'continue'};
+    if (!run || run.finished || run.finalization || event.source === 'extension') return {action: 'continue'};
     if (event.text.startsWith('/')) return {action: 'continue'};
     try {
       await forward(event.text);
@@ -515,6 +647,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on('session_shutdown', async () => {
+    if (lastFinished) stopBoard(lastFinished);
+    if (run) stopBoard(run);
     if (!run || run.finished) return;
     try { await control('interrupt', {reason: 'Conversation ended'}, 2000); } catch { /* Recovery keeps the work. */ }
     await stopWorkers();

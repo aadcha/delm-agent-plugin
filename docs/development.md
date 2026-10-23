@@ -45,6 +45,14 @@ The build stages `.build/plugin-pi/` with the runtime, both extensions, the shar
 
 For one session without installing, use `pi -e /absolute/path/to/this-checkout/hosts/pi/extensions/delm.ts` with `DELM_PI_RUNTIME` pointing at a built runtime; the worker extension is loaded by path into each worker.
 
+Account-backed lifecycle checks, run explicitly because they start real workers on the provider login Pi uses:
+
+```sh
+node hosts/pi/tests/live-lifecycle.mjs all
+```
+
+Scenarios: `update` (a typed update reaches both peers mid-run), `stop` (`/delm:stop` saves unfinished changes and leaves no workers), `recover` (the parent is killed, a new session reports the unfinished run and `/delm:recover` releases it). Evidence lands in `.validation/pi-live/`.
+
 The npm installer does not manage Pi yet: a Pi package is installed from npm or a git ref, and the runtime binary must ship inside it, which needs its own release step.
 
 ### Shared builds

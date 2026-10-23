@@ -28,7 +28,7 @@ CLAUDE_PACKAGE_FILES = (
 )
 PI_PACKAGE_FILES = (
     "package.json", "README.md", "extensions/delm.ts", "extensions/delm-worker.ts",
-    "lib/protocol.ts", "lib/rpc.ts", "lib/bridge.ts", "lib/control.ts",
+    "lib/protocol.ts", "lib/rpc.ts", "lib/bridge.ts", "lib/control.ts", "lib/board.ts",
     "worker.md", "LICENSE", "NOTICE", DEPENDENCY_NOTICES,
 )
 HOST_PACKAGE_FILES = {"codex": PACKAGE_FILES, "claude": CLAUDE_PACKAGE_FILES, "pi": PI_PACKAGE_FILES}

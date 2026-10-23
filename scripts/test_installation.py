@@ -83,7 +83,7 @@ def fixture_source(path):
     })
     (path / "hosts/pi/README.md").write_text("# Unit-test package fixture\n")
     for name in ("extensions/delm.ts", "extensions/delm-worker.ts",
-                 "lib/protocol.ts", "lib/rpc.ts", "lib/bridge.ts", "lib/control.ts"):
+                 "lib/protocol.ts", "lib/rpc.ts", "lib/bridge.ts", "lib/control.ts", "lib/board.ts"):
         (path / "hosts/pi" / name).write_text("export const fixture: boolean = true;\n")
     return path
 

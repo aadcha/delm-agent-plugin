@@ -57,7 +57,7 @@ Open your host in the project you want to change, then invoke DeLM with a reques
 | --- | --- |
 | Codex | `$delm:run <your task>` |
 | Claude Code | `/delm:run <your task>` |
-| Pi | `/delm:run <your task>` (contributor build; see [development](docs/development.md#pi-plugin)) |
+| Pi | `/delm:run <your task>`; a live board opens above the editor, `/delm:board` and `/delm:status` control it, `/delm:stop` cancels, `/delm:recover` after an interrupted session (contributor build; see [development](docs/development.md#pi-plugin)) |
 
 For example, in Claude Code:
 
