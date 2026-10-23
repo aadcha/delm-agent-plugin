@@ -130,7 +130,10 @@ export function renderBoard(view: View, width: number, rows = 14, hint = '/delm:
 /** A full collection for the detail overlay. */
 export function renderCollection(view: View, kind: 'tasks' | 'shared' | 'checks', width: number): string[] {
   const inner = Math.max(20, width - 4);
-  const lines: string[] = [{tasks: 'All tasks', shared: 'Shared context', checks: 'Recorded checks'}[kind] + ' · ' + view[kind].total, ''];
+  const shownCount = view[kind].items.length;
+  const header = {tasks: 'All tasks', shared: 'Shared context', checks: 'Recorded checks'}[kind] + ' · ' + view[kind].total
+    + (view[kind].total > shownCount ? ' · first ' + shownCount + ' shown' : '');
+  const lines: string[] = [header, ''];
   if (kind === 'tasks') {
     if (!view.tasks.items.length) lines.push('No tasks shared yet');
     for (const task of view.tasks.items) {
@@ -203,8 +206,11 @@ export class BoardObserver {
 }
 
 /** One complete collection page for the detail overlay. */
+// The observer serves at most 32 rows per page.
+export const PAGE_LIMIT = 32;
+
 export function fetchCollection(executable: string, runId: string, sessionId: string, collection: 'tasks' | 'shared' | 'checks',
-  limit = 50): Promise<View> {
+  limit = PAGE_LIMIT): Promise<View> {
   return new Promise((resolve, reject) => {
     execFile(executable, ['pi', 'view', '--run-id', runId, '--session-id', sessionId, '--collection', collection, '--limit', String(limit)],
       {timeout: 15000, maxBuffer: 8 * 1024 * 1024}, (error, stdout, stderr) => {
