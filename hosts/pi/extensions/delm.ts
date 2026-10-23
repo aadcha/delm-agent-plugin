@@ -82,16 +82,19 @@ export default function (pi: ExtensionAPI) {
   // ---- actions from the controller ------------------------------------------
 
   async function applyActions(list: Action[]) {
+    const current = run;
+    if (!current) return;
     for (const action of list) {
-      if (!run || run.finished) return;
-      if (action.id && run.lastAction === action.id) continue;
+      if (current.finished && action.type !== 'final') return;
+      if (action.id && current.lastAction === action.id) continue;
       try {
         await applyAction(action);
       } catch (error) {
-        run.failure = String((error as Error).message || error);
-        notify('DeLM: ' + run.failure, 'error');
+        current.failure = String((error as Error).message || error);
+        notify('DeLM: ' + current.failure, 'error');
       }
-      if (action.id) run.lastAction = action.id;
+      if (action.id) current.lastAction = action.id;
+      if (current.finished) return;
     }
   }
 
@@ -137,8 +140,17 @@ export default function (pi: ExtensionAPI) {
           ? 'The delivery requires a focused check in the original project. Perform only the necessary environment setup and checks for the delivered or reconciled files, then state the outcome.'
           : 'Do not run another verification pass or edit files.';
         if (delivered) {
-          pi.sendUserMessage('DeLM completed its handoff. Report this result concisely, using the original project path. '
-            + verification + '\nNative runtime result:\n' + JSON.stringify(action));
+          const delivery = (action.delivery || {}) as {changed_paths?: string[]; merged_paths?: string[]; project?: string; conflicts?: unknown[]};
+          const checks = ((action.shared_checks || []) as {evidence?: {command?: string; completion?: {exit_code?: number}}}[])
+            .map(check => check.evidence?.command + ' (exit ' + check.evidence?.completion?.exit_code + ')').filter(Boolean);
+          const brief = ['DeLM delivered a result into ' + (delivery.project || ctxRef?.cwd) + '.',
+            'Status: ' + outcome + '.',
+            'Changed files: ' + ((delivery.changed_paths || []).join(', ') || 'none') + '.',
+            (delivery.merged_paths || []).length ? 'Merged with your edits: ' + delivery.merged_paths!.join(', ') + '.' : '',
+            checks.length ? 'Checks observed by the runtime: ' + checks.join('; ') + '.' : 'No shared check receipts.',
+            'Worker summary: ' + String(action.summary || ''),
+            'Report this to the user in a few lines, using the project path above. ' + verification].filter(Boolean).join('\n');
+          pi.sendMessage({customType: 'delm-handoff', content: brief, display: false} as never, {triggerTurn: true});
         }
         await cleanup();
         return;
@@ -410,7 +422,7 @@ export default function (pi: ExtensionAPI) {
           try { await control('settlement_failed', {generation: fence.generation, revision: fence.revision}); } catch { /* Recovery. */ }
         }
         current.failure = String((error as Error).message || error);
-        notify('DeLM: ' + current.failure + ' Private workspaces are preserved for recovery.', 'error');
+        notify('DeLM: ' + current.failure + (current.finished ? '' : ' Private workspaces are preserved for recovery.'), 'error');
       }
     })();
     try { await current.settling; } finally { current.settling = null; }
