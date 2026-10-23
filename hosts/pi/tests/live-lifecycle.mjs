@@ -7,7 +7,7 @@
 //
 // Evidence goes to .validation/pi-live/<scenario>-<timestamp>/.
 import {spawn, execFileSync} from 'node:child_process';
-import {existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync} from 'node:fs';
+import {existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, realpathSync} from 'node:fs';
 import {tmpdir, homedir} from 'node:os';
 import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -27,7 +27,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const git = (dir, ...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...a], {cwd: dir, stdio: 'pipe', encoding: 'utf8'});
 
 function project() {
-  const dir = mkdtempSync(join(tmpdir(), 'delm-pi-live-'));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'delm-pi-live-')));
   writeFileSync(join(dir, 'README.md'), '# live fixture\n');
   git(dir, 'init', '-q'); git(dir, 'add', '.'); git(dir, 'commit', '-q', '-m', 'init');
   return dir;

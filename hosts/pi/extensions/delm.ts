@@ -203,23 +203,41 @@ export default function (pi: ExtensionAPI) {
           await control('step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
           return;
         }
+        case 'turn_start': {
+          // Each model call within the run is a native step. After an update
+          // was steered into the run, the next call has it in context, so this
+          // is where the worker acknowledges the new revision (as Claude does
+          // on turn.step). A stale worker is skipped until its update lands.
+          if (!target.turn || target.deliveredRevision !== run.revision) return;
+          await control('step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
+          return;
+        }
         case 'tool_execution_start': {
           if (event.toolName !== 'bash' || !target.turn) return;
           const args = (event.args || {}) as {command?: string};
-          await control('command_start', {
-            agent_id: target.agentId, turn_id: target.turn, call_id: String(event.toolCallId),
-            command: String(args.command ?? ''), cwd: run.bridge.ready.workers[target.slot - 1].cwd,
-          });
+          try {
+            await control('command_start', {
+              agent_id: target.agentId, turn_id: target.turn, call_id: String(event.toolCallId),
+              command: String(args.command ?? ''), cwd: run.bridge.ready.workers[target.slot - 1].cwd,
+            });
+          } catch (error) {
+            // Unrecorded evidence only means this command cannot back a check receipt.
+            run.log('worker ' + target.slot + ' command_start refused: ' + String((error as Error).message || error));
+          }
           return;
         }
         case 'tool_execution_end': {
           if (event.toolName !== 'bash' || !target.turn) return;
           const outcome = commandOutcome(event as {result?: unknown; isError?: boolean});
-          await control('command_end', {
-            agent_id: target.agentId, call_id: String(event.toolCallId), result_ref: String(event.toolCallId),
-            exit_code: outcome.exit_code, is_error: outcome.is_error, interrupted: outcome.interrupted,
-            timed_out: outcome.timed_out, background_task_id: null,
-          });
+          try {
+            await control('command_end', {
+              agent_id: target.agentId, call_id: String(event.toolCallId), result_ref: String(event.toolCallId),
+              exit_code: outcome.exit_code, is_error: outcome.is_error, interrupted: outcome.interrupted,
+              timed_out: outcome.timed_out, background_task_id: null,
+            });
+          } catch (error) {
+            run.log('worker ' + target.slot + ' command_end refused: ' + String((error as Error).message || error));
+          }
           return;
         }
         case 'agent_settled': {

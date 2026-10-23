@@ -125,8 +125,11 @@ Exercised so far:
   published and completed; the other read the board and stood down; delivery into the original project
   completed with no conflicts and both worker trees removed, about 70 seconds end to end.
 
-- `hosts/pi/tests/live-lifecycle.mjs` drives the installed Pi in RPC mode with a real model through
-  three scenarios: a typed update mid-run, `/delm:stop`, and a killed session followed by
-  `/delm:recover`. It bills the provider login and is run explicitly, not by `npm test`.
+- `hosts/pi/tests/live-lifecycle.mjs` drives the installed Pi 1.4.0 in RPC mode with a real model
+  through three scenarios, all passing on 2026-10-22: a typed update mid-run reached both peers and its
+  extra function was delivered; `/delm:stop` left no worker process, no unfinished run and an unchanged
+  project; a killed session left no worker process, the next session reported the unfinished run, and
+  `/delm:recover` saved its changes and released the project. It bills the provider login and is run
+  explicitly, not by `npm test`.
 
 Not exercised yet: steering an actively streaming worker from the UI, a parent restart with recovery, forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.
