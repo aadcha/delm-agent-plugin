@@ -1451,6 +1451,12 @@ fn recover_at(run_dir: &Path, request: &Value) -> Result<Value> {
     saved["finished"] = json!(true);
     saved["candidate"] = Value::Null;
     saved["recovery"] = serde_json::to_value(&recovery)?;
+    // Recovery has just proven the native side stopped, so a finalization that
+    // was still awaiting its shutdown acknowledgment is confirmed; otherwise the
+    // maintenance guard keeps treating the record as unfinished.
+    if saved["finalization"].is_object() {
+        saved["finalization"]["shutdown_ack"] = json!("confirmed");
+    }
     atomic_json(&path, &saved)?;
     Ok(json!({"status":"stopped","recovery":recovery}))
 }
@@ -2813,6 +2819,17 @@ mod tests {
         let roots = c.workspace.workers.clone();
         fs::write(roots[1].join("partial.txt"), "preserve this progress").unwrap();
         assert!(state::check_native_admission(&project, temp.path(), None).is_err());
+        // A cancel that never received its shutdown acknowledgment, as a host that died mid-stop leaves it.
+        c.finalization = Some(Finalization {
+            generation: 1,
+            revision: 1,
+            intent: "cancel",
+            reason: "host_exited",
+            started: true,
+            attempt: 1,
+            shutdown_ack: "pending",
+        });
+        c.persist().unwrap();
         drop(c);
         let mut request = json!({"token":token,"session_id":"session","agents":[{"id":"agent-1","status":"completed"},{"id":"agent-2","status":"killed"}],"background_tasks_stopped":true});
         request["token"] = json!("wrong");
@@ -2828,6 +2845,8 @@ mod tests {
         assert!(Path::new(result["recovery"]["recovery"].as_str().unwrap()).exists());
         assert!(!project.join("partial.txt").exists());
         state::check_native_admission(&project, temp.path(), None).unwrap();
+        let saved = read_state(&run_dir.join("claude.json")).unwrap();
+        assert_eq!(saved["finalization"]["shutdown_ack"], "confirmed");
         assert_eq!(
             recover_at(&run_dir, &request).unwrap()["already_finished"],
             true

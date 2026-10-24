@@ -121,9 +121,14 @@ async function run(prompt) {
         while (!existsSync(process.env.FAKE_PI_MARK) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 100));
       }
       const check = await bash("printf 'hello from delm\\n' > hello.txt && cat hello.txt");
-      // Pi starts another model loop within the same run when it drains a steer; the turn must survive it.
+      // A transient provider error that Pi retries: the parent must not stop the run for it.
+      emit({type: 'message_end', message: {role: 'assistant', stopReason: 'error', errorMessage: '529 {"error":{"type":"overloaded_error","message":"Overloaded"}}'}});
+      emit({type: 'agent_end', messages: [], willRetry: true});
+      // Pi starts another model loop within the same run (retry, or draining a steer); the turn must survive it.
       emit({type: 'agent_start'});
       emit({type: 'turn_start'});
+      emit({type: 'message_end', message: {role: 'assistant', stopReason: 'stop'}});
+      emit({type: 'agent_end', messages: [], willRetry: false});
       let continued = 'continued_turn=ok';
       try { await coordinate('delm_status', {}); } catch (error) { continued = 'continued_turn=' + error.message; }
       if (process.env.FAKE_PI_MARK) appendFileSync(process.env.FAKE_PI_MARK, continued + '\n');

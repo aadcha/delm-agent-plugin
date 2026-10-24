@@ -72,6 +72,10 @@ test('two fake Pi workers deliver a result into the original project', {skip, ti
   clearTimeout(timer);
   try {
     assert.match(String(outcome), /delivered the result/, 'outcome: ' + outcome + '\nnotices: ' + notices.join(' | ') + '\nstderr: ' + stderr.slice(-3000));
+    // The runtime reports each result's actions twice (reply and stdout); the final action must be applied once.
+    await new Promise(resolveWait => setTimeout(resolveWait, 1500));
+    assert.equal(notices.filter(n => /delivered the result/.test(n)).length, 1, 'final action applied once: ' + notices.join(' | '));
+    assert.ok(!notices.some(n => /model request was rejected/.test(n)), 'a retried provider error must not stop the run: ' + notices.join(' | '));
     assert.equal(readFileSync(join(dir, 'hello.txt'), 'utf8'), 'hello from delm\n');
     assert.equal(readFileSync(join(dir, 'README.md'), 'utf8'), '# fixture\n');
     assert.ok(existsSync(mark), 'peer 2 never recorded its launch view; notices: ' + notices.join(' | '));

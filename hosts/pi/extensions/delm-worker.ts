@@ -6,17 +6,13 @@ import type {ExtensionAPI} from '@earendil-works/pi-coding-agent';
 import {requestTicket} from '../lib/bridge.ts';
 import {MCP_SERVER_NAME, coordinationTool, toolArguments} from '../lib/protocol.ts';
 
-const LOADED = Symbol.for('delm.pi.worker');
-
 export default function (pi: ExtensionAPI) {
   const slot = process.env.DELM_PI_WORKER;
   const bridge = process.env.DELM_PI_BRIDGE;
   const runtime = process.env.DELM_PI_RUNTIME;
   if (!slot) return;
-  // A second copy (the installed package plus a `-e` path) must not register twice.
-  const globals = globalThis as unknown as Record<symbol, boolean>;
-  if (globals[LOADED]) return;
-  globals[LOADED] = true;
+  // A second copy (the installed package plus a `-e` path) finds the server registered and stands down.
+  let duplicate = false;
   if (!bridge || !runtime) {
     throw new Error('DeLM worker environment is incomplete: DELM_PI_BRIDGE and DELM_PI_RUNTIME are required.');
   }
@@ -42,16 +38,22 @@ export default function (pi: ExtensionAPI) {
 
   pi.on('session_start', async () => {
     // The sidecar executes a board call only with a ticket the parent reserved.
-    pi.registerMcpServer(MCP_SERVER_NAME, {
-      command: runtime,
-      args: ['pi', 'mcp'],
-      exposure: 'direct',
-      timeout: 120,
-      description: 'DeLM shared task board for this run',
-    } as never);
+    try {
+      pi.registerMcpServer(MCP_SERVER_NAME, {
+        command: runtime,
+        args: ['pi', 'mcp'],
+        exposure: 'direct',
+        timeout: 120,
+        description: 'DeLM shared task board for this run',
+      } as never);
+    } catch (error) {
+      if (!/already registered/i.test(String((error as Error).message))) throw error;
+      duplicate = true;
+    }
   });
 
   pi.on('tool_call', async event => {
+    if (duplicate) return undefined;
     if (event.toolName === 'bash') { bashCalls.push(event.toolCallId); if (bashCalls.length > 256) bashCalls.shift(); return undefined; }
     const tool = coordinationTool(event.toolName);
     if (!tool) { otherCalls.add(event.toolCallId); if (otherCalls.size > 1024) otherCalls.delete(otherCalls.values().next().value as string); return undefined; }
@@ -73,6 +75,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on('tool_result', async event => {
+    if (duplicate) return undefined;
     const ticket = tickets.get(event.toolCallId);
     if (!ticket) return undefined;
     tickets.delete(event.toolCallId);

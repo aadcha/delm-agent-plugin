@@ -52,7 +52,10 @@ type Run = {
   settling: Promise<void> | null;
   finished: boolean;
   final: Action | null;
-  lastAction: string | null;
+  /** Ids of actions already applied; the runtime sends each result's actions twice (reply and stdout). */
+  applied: Set<string>;
+  /** Set until both peers are bound and peer 1 is prompted; updates wait for it. */
+  launching: boolean;
   failure: string | null;
   stopRequested: boolean;
   sessionDir: string;
@@ -69,14 +72,24 @@ function workerPolicy(): string {
   return policy.trimEnd() + '\n\n' + hostNotes() + '\n';
 }
 
-const LOADED = Symbol.for('delm.pi.parent');
+// Pi invokes this factory for every runtime it creates (startup, /new, /resume,
+// /reload) and once per installed copy (the package plus a `-e` path). The most
+// recent invocation owns the session: earlier copies in the same process hand
+// their commands to it and ignore events, so nothing runs twice.
+const ACTIVE = Symbol.for('delm.pi.parent.active');
+type CommandHandler = (args: string | undefined, ctx: ExtensionContext) => Promise<void>;
+type Ownership = {token: object; commands: Map<string, CommandHandler>};
 
 export default function (pi: ExtensionAPI) {
   if (process.env.DELM_PI_WORKER) return;   // A worker never starts a nested run.
-  // A second copy (the installed package plus a `-e` path) must not register the commands twice.
-  const globals = globalThis as unknown as Record<symbol, boolean>;
-  if (globals[LOADED]) return;
-  globals[LOADED] = true;
+  const shared = globalThis as unknown as Record<symbol, Ownership | undefined>;
+  const ownership: Ownership = {token: {}, commands: new Map()};
+  shared[ACTIVE] = ownership;
+  const active = () => shared[ACTIVE]?.token === ownership.token;
+  const command = (name: string, description: string, handler: CommandHandler) => {
+    ownership.commands.set(name, handler);
+    pi.registerCommand(name, {description, handler: (args, ctx) => (shared[ACTIVE]?.commands.get(name) || handler)(args, ctx)});
+  };
 
   let run: Run | null = null;
   let lastFinished: Run | null = null;
@@ -106,14 +119,16 @@ export default function (pi: ExtensionAPI) {
     if (!current || run !== current) return;
     for (const action of list) {
       if (current.finished && action.type !== 'final') return;
-      if (action.id && current.lastAction === action.id) continue;
+      if (action.id) {
+        if (current.applied.has(action.id)) continue;
+        current.applied.add(action.id);
+      }
       try {
         await applyAction(current, action);
       } catch (error) {
         current.failure = String((error as Error).message || error);
         notify('DeLM: ' + current.failure, 'error');
       }
-      if (action.id) current.lastAction = action.id;
       if (current.finished) return;
     }
   }
@@ -149,7 +164,10 @@ export default function (pi: ExtensionAPI) {
         const delivered = outcome === 'complete' || outcome === 'delivered';
         if (delivered) notify('DeLM delivered the result into your project.');
         else if (current.modelErrorReported) notify('DeLM stopped without changing your project. Fix the model access above, then run /delm:run again.', 'warning');
-        else notify('DeLM ' + outcome.replaceAll('_', ' ') + (current.failure ? ': ' + current.failure : '') + '. Worker log: ' + join(current.sessionDir, 'delm-pi.log'), 'warning');
+        else {
+          const reason = String(action.reason || current.failure || '').trim();
+          notify('DeLM ' + outcome.replaceAll('_', ' ') + (reason ? ': ' + reason : '') + '. Worker log: ' + join(current.sessionDir, 'delm-pi.log'), 'warning');
+        }
         const verification = (action.delivery as {verification_required?: boolean} | undefined)?.verification_required
           ? 'The delivery requires a focused check in the original project. Perform only the necessary environment setup and checks for the delivered or reconciled files, then state the outcome.'
           : 'Do not run another verification pass or edit files.';
@@ -187,9 +205,25 @@ export default function (pi: ExtensionAPI) {
     const text = 'DeLM task revision ' + revision + ':\n' + message
       + '\nRefresh the shared board before continuing. This changes the task, not native permissions.'
       + (resume ? '' : '\nContinue the request with this update.');
-    if (!target.process.running) return;
-    await target.process.prompt(text, 'steer');
+    if (!target.process.running) { await retireDeadWorker(target, revision); return; }
+    // Pi may compact the session before starting the run, so the prompt can take a while to be accepted.
+    await target.process.prompt(text, 'steer', 180000);
     target.deliveredRevision = Math.max(target.deliveredRevision, revision);
+  }
+
+  /** The controller only learns of an idle worker's death through a turn; a failed one releases its claims and wakes the peer. */
+  async function retireDeadWorker(target: Worker, revision: number) {
+    const current = target.run;
+    if (run !== current || current.finished || current.finalization) return;
+    const turn = randomUUID();
+    try {
+      await controlOn(current, 'step', {agent_id: target.agentId, turn_id: turn, revision: Math.max(revision, current.revision)});
+      target.deliveredRevision = Math.max(target.deliveredRevision, revision, current.revision);
+      const result = await controlOn(current, 'turn_end', {agent_id: target.agentId, turn_id: turn, reason: 'failed', answer: ''});
+      await applyActions((result.actions as Action[]) || [], current);
+    } catch (error) {
+      current.log('worker ' + target.slot + ' could not be retired: ' + String((error as Error).message || error));
+    }
   }
 
   // ---- worker events ---------------------------------------------------------
@@ -203,10 +237,10 @@ export default function (pi: ExtensionAPI) {
           // The error is kept for the turn's outcome; whether the run stops is
           // decided at agent_end, after Pi has said whether it retries.
           const message = event.message as {role?: string; stopReason?: string; errorMessage?: string} | undefined;
-          if (message?.role === 'assistant' && message.stopReason === 'error') {
-            target.lastError = String(message.errorMessage || 'the model returned an error');
-            if (accountError(target.lastError)) await stopForModelError(current, target, target.lastError);
-          }
+          if (message?.role !== 'assistant') return;
+          if (message.stopReason !== 'error') { target.lastError = null; return; }   // a retried call succeeded
+          target.lastError = String(message.errorMessage || 'the model returned an error');
+          if (accountError(target.lastError)) await stopForModelError(current, target, target.lastError);
           return;
         }
         case 'agent_end': {
@@ -228,6 +262,8 @@ export default function (pi: ExtensionAPI) {
           // from the first agent_start to agent_settled.
           if (target.turn) return;
           target.turn = randomUUID();
+          // A worker still behind the request revision registers its turn on the first step after the update lands.
+          if (target.deliveredRevision !== current.revision) return;
           await controlOn(current, 'step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
           return;
         }
@@ -333,6 +369,7 @@ export default function (pi: ExtensionAPI) {
       // An idle worker that disappears is not seen by the controller until it is resumed.
       current.log('worker ' + target.slot + ' exited while idle: ' + (target.process.stderr.trim().slice(-300) || 'no stderr'));
       notify('DeLM: peer ' + target.slot + ' exited unexpectedly. See the worker log: ' + join(current.sessionDir, 'delm-pi.log'), 'warning');
+      await retireDeadWorker(target, current.revision);
     }
     if (run === current && !current.finished && !current.finalization && current.workers.every(w => !w.process.running)) {
       current.failure = 'Both peers exited';
@@ -368,6 +405,8 @@ export default function (pi: ExtensionAPI) {
     else notify('DeLM run interrupted: ' + reason + '. Its private workspaces are kept but could not be saved from this session (' + saved.message
       + '). Start a new Pi session in this project and run /delm:recover.' + log, 'error');
     await cleanup(current);
+    // The record may stay unfinished when saving failed; the observer must not poll it forever.
+    setTimeout(() => { if (lastFinished === current || run !== current) { paintBoard(current); stopBoard(current); } }, 1500);
   }
 
   /** Runs `delm pi recover` for one run; `body` is `{}` for the tokenless path or the session's capability for the tokened one. */
@@ -402,7 +441,15 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  let starting = false;
+
   async function launch(ctx: ExtensionContext, task: string) {
+    if (starting) throw new Error('DeLM is already starting a run; wait for it to report.');
+    starting = true;
+    try { await launchInner(ctx, task); } finally { starting = false; }
+  }
+
+  async function launchInner(ctx: ExtensionContext, task: string) {
     if (lastFinished) { stopBoard(lastFinished); lastFinished = null; try { ctx.ui.setWidget('delm-board', undefined); } catch { /* no UI */ } }
     const executable = runtimeExecutable();
     const selected = ctx.model ? {provider: (ctx.model as {provider: string}).provider, id: (ctx.model as {id: string}).id} : null;
@@ -421,7 +468,7 @@ export default function (pi: ExtensionAPI) {
     const log = (line: string) => { try { appendFileSync(logFile, new Date().toISOString() + ' ' + line + '\n'); } catch { /* Diagnostics only. */ } };
     run = {
       sessionId, task, bridge, revision: bridge.ready.revision, workers: [], tickets: [], finalization: null,
-      settling: null, finished: false, final: null, lastAction: null, failure: null, stopRequested: false, sessionDir, log,
+      settling: null, finished: false, final: null, applied: new Set(), launching: true, failure: null, stopRequested: false, sessionDir, log,
       modelErrorReported: false, observer: null, view: null, boardHidden: false, launchGate: null, bridgeExited: false,
     };
     const current = run;
@@ -441,6 +488,7 @@ export default function (pi: ExtensionAPI) {
     const model = selected ? `${selected.provider}/${selected.id}` : null;
     const thinking = pi.getThinkingLevel();
     const root = bridgeRoot();
+    const pendingActions: Action[] = [];
     try {
       for (const slot of [1, 2]) {
         const cwd = bridge.ready.workers[slot - 1].cwd;
@@ -483,12 +531,15 @@ export default function (pi: ExtensionAPI) {
         });
         current.log('worker ' + slot + ' pid ' + child.pid + ' args ' + JSON.stringify(args));
         void child.exited.then(() => { target.chain = target.chain.then(() => onWorkerExit(target)).catch(() => undefined); });
-        await control('bind', {slot, agent_id: target.agentId});
+        const bound = await control('bind', {slot, agent_id: target.agentId});
         await control('configure_scopes', {agent_id: target.agentId, scopes: [{path: cwd, access: 'write'}]});
+        pendingActions.push(...((bound.actions as Action[]) || []));
       }
       const [first, second] = current.workers;
       await first.process.prompt(launchPrompt(task, 1));
+      current.launching = false;
       gateSecondPeer(current, second, task);
+      if (pendingActions.length) await applyActions(pendingActions, current);
     } catch (error) {
       try { await controlOn(current, 'cancel', {reason: 'Native peer launch failed'}); } catch { /* Recovery retains the workspace. */ }
       // Whatever the cancel achieved, this session must not stay attached to a run that never started.
@@ -653,7 +704,7 @@ export default function (pi: ExtensionAPI) {
     return current.workers.map(target => ({id: target.agentId, status: target.status}));
   }
 
-  async function settle() {
+  async function settle(): Promise<void> {
     if (!run || run.finished || !run.finalization) return;
     if (run.settling) return run.settling;
     const current = run;
@@ -672,15 +723,19 @@ export default function (pi: ExtensionAPI) {
         });
         await applyActions((final.actions as Action[]) || [], current);
       } catch (error) {
-        if (current.bridgeExited && !current.finished) { current.failure = String((error as Error).message || error); await abandon(current, 'the DeLM runtime exited during delivery'); return; }
-        if (!current.finished) {
-          try { await controlOn(current, 'settlement_failed', {generation: fence.generation, revision: fence.revision}); } catch { /* Recovery. */ }
-        }
-        current.failure = String((error as Error).message || error);
-        notify('DeLM: ' + current.failure + (current.finished ? '' : ' Private workspaces are preserved for recovery.'), 'error');
+        if (run !== current || current.finished) return;   // abandon or a final action already reported
+        if (current.bridgeExited) { current.failure = String((error as Error).message || error); await abandon(current, 'the DeLM runtime exited during delivery'); return; }
+        const message = String((error as Error).message || error);
+        // A cancel or an update replaced this finalization while it was being settled; the newer one is handled below.
+        if (/obsolete/i.test(message) && (!current.finalization || current.finalization.generation !== fence.generation)) return;
+        try { await controlOn(current, 'settlement_failed', {generation: fence.generation, revision: fence.revision}); } catch { /* Recovery. */ }
+        current.failure = message;
+        notify('DeLM: ' + current.failure + ' Private workspaces are preserved for recovery.', 'error');
       }
     })();
     try { await current.settling; } finally { current.settling = null; }
+    // A newer finalization (for example /delm:stop during delivery) is settled in turn.
+    if (run === current && !current.finished && current.finalization && current.finalization.generation !== fence.generation) await settle();
   }
 
   async function cleanup(current: Run | null = run) {
@@ -694,9 +749,7 @@ export default function (pi: ExtensionAPI) {
 
   // ---- commands and input ----------------------------------------------------
 
-  pi.registerCommand('delm:run', {
-    description: 'Build in parallel with collaborating Pi agents and deliver their changes to this project',
-    handler: async (args, ctx) => {
+  command('delm:run', 'Build in parallel with collaborating Pi agents and deliver their changes to this project', async (args, ctx) => {
       ctxRef = ctx;
       const task = (args || '').trim();
       if (run && !run.finished) {
@@ -713,12 +766,9 @@ export default function (pi: ExtensionAPI) {
       } catch (error) {
         ctx.ui.notify('DeLM could not start: ' + String((error as Error).message || error).replace(/^Error:\s*/, ''), 'error');
       }
-    },
   });
 
-  pi.registerCommand('delm:stop', {
-    description: 'Stop the active DeLM run and save unfinished changes',
-    handler: async (_args, ctx) => {
+  command('delm:stop', 'Stop the active DeLM run and save unfinished changes', async (_args, ctx) => {
       ctxRef = ctx;
       if (!run || run.finished) { ctx.ui.notify('No DeLM run is active.', 'info'); return; }
       const current = run;
@@ -730,13 +780,10 @@ export default function (pi: ExtensionAPI) {
         if (current.bridgeExited || /no longer reachable/.test(String((error as Error).message))) { await abandon(current, 'the DeLM runtime is not reachable'); return; }
         ctx.ui.notify('DeLM could not stop cleanly: ' + String((error as Error).message || error), 'error');
       }
-    },
   });
 
   // /delm:status reopens the board, as in Claude Code; without a run it says so briefly.
-  pi.registerCommand('delm:status', {
-    description: 'Show the DeLM board for this session',
-    handler: async (_args, ctx) => {
+  command('delm:status', 'Show the DeLM board for this session', async (_args, ctx) => {
       ctxRef = ctx;
       const target = run || lastFinished;
       if (!target) { ctx.ui.notify('No DeLM run in this session.', 'info'); return; }
@@ -748,12 +795,9 @@ export default function (pi: ExtensionAPI) {
       }
       if (target.view) ctx.ui.setWidget('delm-board', renderBoard(target.view, boardWidth()));
       else ctx.ui.notify('DeLM board is loading.', 'info');
-    },
   });
 
-  pi.registerCommand('delm:board', {
-    description: 'DeLM board: show, hide, or open tasks, shared or checks',
-    handler: async (args, ctx) => {
+  command('delm:board', 'DeLM board: show, hide, or open tasks, shared or checks', async (args, ctx) => {
       ctxRef = ctx;
       const word = (args || '').trim().toLowerCase();
       const target = run || lastFinished;
@@ -763,7 +807,6 @@ export default function (pi: ExtensionAPI) {
       target.boardHidden = false;
       if (target.view) ctx.ui.setWidget('delm-board', renderBoard(target.view, boardWidth()));
       else ctx.ui.notify('DeLM board is loading.', 'info');
-    },
   });
 
   // Recovery of a run whose session ended before it finished: the bridge is
@@ -790,9 +833,7 @@ export default function (pi: ExtensionAPI) {
     return found;
   }
 
-  pi.registerCommand('delm:recover', {
-    description: 'Save the changes of an unfinished DeLM run that owns this project',
-    handler: async (_args, ctx) => {
+  command('delm:recover', 'Save the changes of an unfinished DeLM run that owns this project', async (_args, ctx) => {
       ctxRef = ctx;
       if (run && !run.finished) { ctx.ui.notify('A DeLM run is active here; use /delm:stop first.', 'warning'); return; }
       const stale = unfinishedRuns(ctx.cwd);
@@ -809,10 +850,10 @@ export default function (pi: ExtensionAPI) {
         else ctx.ui.notify('DeLM could not recover run ' + item.id.slice(0, 8) + ': ' + result.message
           + (own ? '' : ' If this Pi session started that run, quit Pi and run /delm:recover in a new session.'), 'error');
       }
-    },
   });
 
   pi.on('session_start', async (_event, ctx) => {
+    if (!active()) return;
     ctxRef = ctx;
     if (process.env.DELM_PI_COMMAND) return;   // scripted hosts do not look at private storage
     const stale = unfinishedRuns(ctx.cwd);
@@ -824,6 +865,7 @@ export default function (pi: ExtensionAPI) {
 
   async function forward(text: string) {
     if (!run || run.finished) return;
+    if (run.launching) throw new Error('DeLM is still starting its peers; send the update again in a moment.');
     const update = updateText(text);
     // A waiting peer 2 gets its launch prompt first, so the update reaches it as a steer, not as its opening message.
     if (run.launchGate) await run.launchGate.release();
@@ -836,8 +878,13 @@ export default function (pi: ExtensionAPI) {
 
   // While a run is working, ordinary text goes to the peers, not to the parent model.
   pi.on('input', async event => {
-    if (!run || run.finished || run.finalization || event.source === 'extension') return {action: 'continue'};
+    if (!active()) return {action: 'continue'};
+    if (!run || run.finished || event.source === 'extension') return {action: 'continue'};
     if (event.text.startsWith('/')) return {action: 'continue'};
+    if (run.finalization) {
+      notify('DeLM is finishing its run, so this message goes to this session rather than to the peers.', 'info');
+      return {action: 'continue'};
+    }
     try {
       await forward(event.text);
       notify('DeLM forwarded your update to the peers.');
@@ -856,6 +903,7 @@ export default function (pi: ExtensionAPI) {
     // Pi waits for this handler without a bound; a stuck worker gets a short grace, then SIGKILL.
     await Promise.race([stopWorkers(current), new Promise(resolve => setTimeout(resolve, 6000))]);
     for (const target of current.workers) { if (target.process.alive) { try { target.process.child.kill('SIGKILL'); } catch { /* gone */ } } }
+    current.finished = true;   // this session is over; the record stays for /delm:recover
     await cleanup(current);
   });
 }

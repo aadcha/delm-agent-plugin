@@ -132,8 +132,8 @@ export class PiProcess {
     });
   }
 
-  prompt(message: string, streamingBehavior?: 'steer' | 'followUp'): Promise<{disposition: string}> {
-    return this.send({type: 'prompt', message, ...(streamingBehavior ? {streamingBehavior} : {})});
+  prompt(message: string, streamingBehavior?: 'steer' | 'followUp', timeoutMs = 30000): Promise<{disposition: string}> {
+    return this.send({type: 'prompt', message, ...(streamingBehavior ? {streamingBehavior} : {})}, timeoutMs);
   }
 
   steer(message: string): Promise<{disposition: string}> { return this.send({type: 'steer', message}); }
