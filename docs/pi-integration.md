@@ -156,4 +156,4 @@ Exercised so far:
   the project unchanged with no worker process (checked by pid), and a second run delivered nine files with the final
   board repainted at Complete and no Pi truncation notice.
 
-Not exercised yet: steering an actively streaming worker from the UI, a parent restart with recovery, forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.
+Not exercised yet: steering an actively streaming worker from the UI, resuming stopped workers after an extension reload (the tokened `recover` path Claude Code uses; Pi only saves and releases), forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.

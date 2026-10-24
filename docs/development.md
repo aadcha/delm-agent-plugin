@@ -1,6 +1,6 @@
 # Development
 
-Use macOS with Git, Python 3, Xcode Command Line Tools, the Rust toolchain pinned in `rust-toolchain.toml`, and Node.js 22 or later. Install the native CLI for the host you are developing: stock Codex, or Claude Code 2.1.289 or later. Account login is needed for interactive use and explicitly authorized real-task checks; routine verification does not start model turns.
+Use macOS with Git, Python 3, Xcode Command Line Tools, the Rust toolchain pinned in `rust-toolchain.toml`, and Node.js 22 or later. Install the native CLI for the host you are developing: stock Codex, or Claude Code 2, or Pi (`@earendil-works/pi-coding-agent`, Node.js 22.19 or later).1.289 or later. Account login is needed for interactive use and explicitly authorized real-task checks; routine verification does not start model turns.
 
 Run the following commands from the repository root. Host packages share one Rust runtime and the collaboration policy in `plugin/worker.md`.
 
@@ -41,7 +41,7 @@ Install [Pi](https://pi.dev) (`npm install -g --ignore-scripts @earendil-works/p
 pi install "$PWD/.build/plugin-pi"
 ```
 
-The build stages `.build/plugin-pi/` with the runtime, both extensions, the shared worker policy and the manifest, and checks the TypeScript syntax with Node. Pi loads the package from that path in place; rebuild and start a new Pi session to pick up changes. Open the intended project in `pi` and invoke `/delm:run <task>`; the other commands are `/delm:status`, `/delm:stop`, `/delm:board [hide|tasks|shared|checks]` and `/delm:recover`. `pi remove "$PWD/.build/plugin-pi"` uninstalls it. Pi resources live in `hosts/pi/`; the controller is shared with Claude Code (`delm pi serve`, see [Pi integration](pi-integration.md)).
+The build stages `.build/plugin-pi/` with the runtime, both extensions, the shared worker policy and the manifest, strips the types from each TypeScript file with Node and checks the result as JavaScript, and probes the staged runtime for the Pi commands. Pi loads the package from that path in place; rebuild and start a new Pi session to pick up changes. Open the intended project in `pi` and invoke `/delm:run <task>`; the other commands are `/delm:status`, `/delm:stop`, `/delm:board [hide|tasks|shared|checks]` and `/delm:recover`. `pi remove "$PWD/.build/plugin-pi"` uninstalls it. Pi resources live in `hosts/pi/`; the controller is shared with Claude Code (`delm pi serve`, see [Pi integration](pi-integration.md)).
 
 For one session without installing, use `pi -e /absolute/path/to/this-checkout/hosts/pi/extensions/delm.ts` with `DELM_PI_RUNTIME` pointing at a built runtime; the worker extension is loaded by path into each worker. With the package also installed, the second copy of each extension no-ops, so `pi remove` is not required. The checkout's `hosts/pi/worker.md` is a development copy of `plugin/worker.md`; the build stages the shared file and the unit tests fail if the copies drift.
 
@@ -57,7 +57,7 @@ The npm installer does not manage Pi yet: a Pi package is installed from npm or 
 
 ### Shared builds
 
-`./scripts/build.sh --host all` builds the runtime once and stages both packages. A compatible prebuilt runtime can be supplied with `--prebuilt /absolute/path/to/delm`. Neither staging operation installs a plugin or changes the user's native permissions.
+`./scripts/build.sh --host all` builds the runtime once and stages all three packages (Codex, Claude Code and Pi; the Pi package needs Node.js). A compatible prebuilt runtime can be supplied with `--prebuilt /absolute/path/to/delm`. Neither staging operation installs a plugin or changes the user's native permissions.
 
 ## Focused verification
 

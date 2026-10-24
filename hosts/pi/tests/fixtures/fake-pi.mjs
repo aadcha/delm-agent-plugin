@@ -7,7 +7,7 @@
 // waiting on worker 1 on every prompt. The scenario is selected by
 // DELM_PI_WORKER; the controller, sidecar and delivery are production code.
 import {spawn} from 'node:child_process';
-import {appendFileSync, writeFileSync} from 'node:fs';
+import {appendFileSync, existsSync, writeFileSync} from 'node:fs';
 import {connect} from 'node:net';
 import {createInterface} from 'node:readline';
 
@@ -99,17 +99,27 @@ function bash(command) {
   });
 }
 
+let onAbort = null;
+
 async function run(prompt) {
   streaming = true;
   emit({type: 'agent_start'});
   emit({type: 'turn_start'});
+  if (scenario === 'idle') {
+    // A worker that is thinking for a long time; the abort command settles it.
+    await new Promise(resolve => { onAbort = resolve; });
+    return;
+  }
   try {
     if (slot === 1 && scenario === 'deliver') {
       // Planning takes a moment; peer 2 must not be prompted before this task exists.
       if (process.env.FAKE_PI_MARK) await new Promise(resolve => setTimeout(resolve, 2000));
       await coordinate('delm_task_create', {idempotency_key: 'task-1-' + calls, title: 'Write hello.txt', description: 'Create hello.txt with a greeting.', kind: 'implementation'});
-      // Leave the run active long enough for peer 2's duplicate attempt to be judged.
-      if (process.env.FAKE_PI_MARK) await new Promise(resolve => setTimeout(resolve, 4000));
+      // Stay active until peer 2 has recorded its duplicate attempt (bounded, so a broken gate still ends the test).
+      if (process.env.FAKE_PI_MARK) {
+        const until = Date.now() + 30000;
+        while (!existsSync(process.env.FAKE_PI_MARK) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 100));
+      }
       const check = await bash("printf 'hello from delm\\n' > hello.txt && cat hello.txt");
       // Pi starts another model loop within the same run when it drains a steer; the turn must survive it.
       emit({type: 'agent_start'});
@@ -164,6 +174,7 @@ input.on('line', line => {
     case 'abort':
       respond(command.id, 'abort');
       if (streaming) { streaming = false; emit({type: 'agent_settled', aborted: true}); }
+      onAbort?.();
       break;
     case 'get_last_assistant_text':
       respond(command.id, 'get_last_assistant_text', {text: lastText});

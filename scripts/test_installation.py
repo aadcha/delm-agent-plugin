@@ -668,6 +668,19 @@ class BuildTests(unittest.TestCase):
                  self.assertRaisesRegex(RuntimeError, "does not provide the Pi host commands"):
                 build.build(source, runtime, host="pi")
             self.assertFalse((source / ".build/plugin-pi").exists())
+            self.assertEqual([p.name for p in (source / ".build").iterdir() if p.name.startswith("plugin-pi-stage")], [],
+                             "a failed validation must not leave a staged copy behind")
+
+    def test_malformed_typescript_cannot_stage_the_pi_package(self):
+        with tempfile.TemporaryDirectory(prefix="delm pi build ") as temporary:
+            source = fixture_source(Path(temporary) / "source")
+            runtime = Path(temporary) / "runtime"
+            fixture_runtime(runtime)
+            (source / "hosts/pi/lib/board.ts").write_text("export const broken: = ;\n")
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaisesRegex(RuntimeError, "Invalid TypeScript in board.ts"):
+                build.build(source, runtime, host="pi")
+            self.assertFalse((source / ".build/plugin-pi").exists())
 
     def test_old_same_version_runtime_cannot_activate_claude_package(self):
         with tempfile.TemporaryDirectory() as temporary:

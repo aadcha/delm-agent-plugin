@@ -40,7 +40,12 @@ export class PiProcess {
       this.pending.clear();
       settled?.({code, signal});
     };
-    this.child.once('exit', (code, signal) => finish(code, signal));
+    // 'close' follows 'exit' once stdio drained, so the last events are delivered before
+    // the exit is reported; a child whose pipes are held open by a grandchild is not waited for.
+    this.child.once('exit', (code, signal) => {
+      const timer = setTimeout(() => finish(code, signal), 250);
+      this.child.once('close', () => { clearTimeout(timer); finish(code, signal); });
+    });
     this.child.on('error', error => {
       this.spawnError = this.spawnError || error;
       for (const waiter of this.pending.values()) waiter.reject(error);
@@ -60,7 +65,10 @@ export class PiProcess {
     this.child.stderr?.on('error', () => { /* Diagnostics only. */ });
   }
 
-  get running(): boolean { return this.pid > 0 && !this.spawnError && this.exitCode === null && this.exitSignal === null && !this.child.killed; }
+  /** The process has not reported its exit; a signal may already be on its way. */
+  get alive(): boolean { return this.pid > 0 && !this.spawnError && this.exitCode === null && this.exitSignal === null; }
+  /** Alive and not yet asked to stop. */
+  get running(): boolean { return this.alive && !this.child.killed; }
   get stderr(): string { return this.stderrTail; }
 
   onEvent(listener: (event: RpcEvent) => void): () => void {
@@ -106,7 +114,7 @@ export class PiProcess {
   }
 
   send<T = unknown>(command: Record<string, unknown>, timeoutMs = 30000): Promise<T> {
-    if (this.spawnError) return Promise.reject(new Error('Pi worker could not start: ' + this.spawnError.message));
+    if (this.spawnError || !this.pid) return Promise.reject(new Error('Pi worker could not start' + (this.spawnError ? ': ' + this.spawnError.message : '.')));
     if (!this.running || !this.child.stdin?.writable) return Promise.reject(new Error('Pi worker is not running.'));
     const id = 'delm-' + (++this.sequence);
     return new Promise<T>((resolve, reject) => {

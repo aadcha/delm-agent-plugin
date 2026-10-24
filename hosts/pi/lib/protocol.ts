@@ -16,12 +16,28 @@ export type Ready = {
   [key: string]: unknown;
 };
 
-export function decodeLines(buffer: string, chunk: string): {rest: string; events: Record<string, unknown>[]} {
+/**
+ * Splits the runtime's stdout into JSON records. A line that is not JSON (a
+ * stray diagnostic) is returned in `skipped` and never costs the records
+ * around it; an unterminated line over the limit is dropped the same way.
+ */
+export function decodeLines(buffer: string, chunk: string): {rest: string; events: Record<string, unknown>[]; skipped: string[]} {
   const combined = buffer + chunk;
-  if (combined.length > 2 * 1024 * 1024) throw new Error('DeLM exceeded its event size limit.');
   const lines = combined.split('\n');
-  const rest = lines.pop() ?? '';
-  return {rest, events: lines.filter(line => line.trim()).map(line => JSON.parse(line.endsWith('\r') ? line.slice(0, -1) : line))};
+  let rest = lines.pop() ?? '';
+  const events: Record<string, unknown>[] = [];
+  const skipped: string[] = [];
+  for (const raw of lines) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    if (!line.trim()) continue;
+    try {
+      const value = JSON.parse(line);
+      if (value && typeof value === 'object' && !Array.isArray(value)) events.push(value as Record<string, unknown>);
+      else skipped.push(line);
+    } catch { skipped.push(line.slice(0, 200)); }
+  }
+  if (rest.length > 2 * 1024 * 1024) { skipped.push(rest.slice(0, 200) + '… (oversized line dropped)'); rest = ''; }
+  return {rest, events, skipped};
 }
 
 export function validateReady(value: Record<string, unknown>): Ready {
@@ -99,11 +115,10 @@ export function launchPrompt(task: string, slot: number, planned = true): string
  * "Calc ops.py, tests" collide, while symbols that name different work ("C++" vs "C", "#12") survive.
  */
 export function normalizeTitle(title: unknown): string {
-  return String(title ?? '').toLowerCase()
-    .replace(/[\s_/\\.,:;'"`()\[\]{}|<>!?-]+/gu, ' ')
-    .split(' ')
-    .filter(token => token && /[\p{L}\p{N}]/u.test(token))
-    .join(' ');
+  // Tokens are words and numbers, keeping an attached `++`, `#` or `%` (c++, c#, 50%) and issue
+  // numbers (#12); everything else, including a `+` or `&` standing between words, is a separator.
+  const tokens = String(title ?? '').toLowerCase().match(/#\d+|[\p{L}\p{N}]+(?:\+\+|#(?!\d)|%)?/gu) || [];
+  return tokens.join(' ');
 }
 
 export type OpenTask = {id: number; task_number?: number; title: string; state: string; owner?: number | null};
@@ -173,7 +188,10 @@ export function explainModelError(raw: string): string {
   if (/\b429\b|rate[ _]limit|overloaded|\b529\b/i.test(whole)) {
     return 'The provider is rate limiting or overloaded (' + text.slice(0, 160) + '). Wait a minute and run /delm:run again.';
   }
-  if (/model not found|does not exist|unsupported model|\b404\b/i.test(whole)) {
+  if (/credit balance|insufficient_quota|billing_not_active|payment required|\b402\b/i.test(whole)) {
+    return 'The provider account has no credit for this login (' + text.slice(0, 160) + '). Add credit or run /login in Pi with another account.';
+  }
+  if (/model not found|does not exist|unsupported model|not_found_error|^\s*404\b/i.test(whole)) {
     return 'The provider does not offer this session\'s model to the workers (' + text.slice(0, 160) + '). Pick another model with /model and run /delm:run again.';
   }
   return 'The provider returned: ' + text.slice(0, 300);

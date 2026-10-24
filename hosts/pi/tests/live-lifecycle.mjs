@@ -85,13 +85,13 @@ function strayWorkers(since) {
   for (const dir of sessions) {
     let log = '';
     try { log = readFileSync(join(dir, 'delm-pi.log'), 'utf8'); } catch { continue; }
-    for (const match of log.matchAll(/worker (\d) pid (\d+)/g)) {
+    for (const match of log.matchAll(/(worker \d|runtime) pid (\d+)/g)) {
       const pid = Number(match[2]);
-      try { process.kill(pid, 0); alive.push('worker ' + match[1] + ' pid ' + pid + ' (' + dir + ')'); } catch { /* exited */ }
+      if (pid <= 1) continue;
+      try { process.kill(pid, 0); alive.push(match[1] + ' pid ' + pid + ' (' + dir + ')'); } catch { /* exited */ }
     }
   }
-  const out = execFileSync('ps', ['-eo', 'pid,command'], {encoding: 'utf8'});
-  return alive.concat(out.split('\n').filter(line => /delm pi serve/.test(line)));
+  return alive;
 }
 
 function unfinishedRuns(dir) {

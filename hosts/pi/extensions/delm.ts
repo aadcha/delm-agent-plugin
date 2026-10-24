@@ -343,15 +343,46 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /** The runtime is gone, so no delivery or cancel can reach it: release the session, keep the workspaces for /delm:recover. */
+  /**
+   * The runtime is gone or unreachable, so no delivery or cancel can reach it.
+   * The session still holds the run's capability token, so it saves the
+   * unfinished changes itself through the tokened recovery path and releases
+   * the project; only if that fails is the user pointed at /delm:recover.
+   */
   async function abandon(current: Run, reason: string) {
     if (run !== current || current.finished) return;
     current.finished = true;
     current.failure = current.failure || reason;
-    await stopWorkers(current);
-    notify('DeLM run interrupted: ' + reason + '. Its private workspaces are kept; run /delm:recover to save the unfinished changes. Worker log: '
-      + join(current.sessionDir, 'delm-pi.log'), 'error');
+    const agents = await stopWorkers(current);
+    if (!current.bridgeExited) {
+      // Recovery needs the bridge process gone; an unreachable one is ended here.
+      try { current.bridge.process.kill('SIGTERM'); } catch { /* already gone */ }
+      await Promise.race([current.bridge.exited, new Promise(resolve => setTimeout(resolve, 5000))]);
+      if (!current.bridgeExited) { try { current.bridge.process.kill('SIGKILL'); } catch { /* gone */ } await Promise.race([current.bridge.exited, new Promise(resolve => setTimeout(resolve, 2000))]); }
+    }
+    const saved = await recoverRun(current.bridge.ready.run_id, {
+      token: current.bridge.ready.token, session_id: current.sessionId, background_tasks_stopped: true, agents,
+    });
+    const log = ' Worker log: ' + join(current.sessionDir, 'delm-pi.log');
+    if (saved.ok) notify('DeLM run interrupted: ' + reason + '. ' + saved.message + ' Your project is unchanged.' + log, 'error');
+    else notify('DeLM run interrupted: ' + reason + '. Its private workspaces are kept but could not be saved from this session (' + saved.message
+      + '). Start a new Pi session in this project and run /delm:recover.' + log, 'error');
     await cleanup(current);
+  }
+
+  /** Runs `delm pi recover` for one run; `body` is `{}` for the tokenless path or the session's capability for the tokened one. */
+  function recoverRun(id: string, body: Record<string, unknown>): Promise<{ok: boolean; message: string}> {
+    return new Promise(resolve => {
+      const child = execFile(runtimeExecutable(), ['pi', 'recover', '--run-id', id], {timeout: 120000}, (error, stdout, stderr) => {
+        if (error) return resolve({ok: false, message: String(stderr || error.message).trim().slice(0, 300)});
+        let result: {status?: string; recovery?: {recovery?: string}} = {};
+        try { result = JSON.parse(String(stdout).trim().split('\n').at(-1) || '{}'); } catch { /* raw */ }
+        resolve({ok: true, message: 'Run ' + id.slice(0, 8) + ' ' + String(result.status || 'recovered') + '.'
+          + (result.recovery?.recovery ? ' Unfinished changes were saved to ' + result.recovery.recovery + '.' : ' Nothing needed saving.')});
+      });
+      child.stdin?.on('error', () => { /* The exit callback reports the outcome. */ });
+      child.stdin?.end(JSON.stringify(body) + '\n');
+    });
   }
 
   // ---- launch ----------------------------------------------------------------
@@ -395,7 +426,7 @@ export default function (pi: ExtensionAPI) {
     };
     const current = run;
     startBoard(ctx);
-    log('run ' + bridge.ready.run_id + ' project ' + ctx.cwd + ' sessions ' + sessionDir);
+    log('run ' + bridge.ready.run_id + ' project ' + ctx.cwd + ' sessions ' + sessionDir + ' runtime pid ' + bridge.process.pid);
     void bridge.exited.then(async code => {
       current.bridgeExited = true;
       if (run !== current || current.finished) return;
@@ -414,7 +445,8 @@ export default function (pi: ExtensionAPI) {
       for (const slot of [1, 2]) {
         const cwd = bridge.ready.workers[slot - 1].cwd;
         const bridgePath = join(root, bridge.ready.run_id + '-' + slot + '.sock');
-        const tickets = new TicketServer(bridgePath, message => ticketHandler(slot, message));
+        const tickets = new TicketServer(bridgePath, message => ticketHandler(slot, message),
+          ticket => { void controlOn(current, 'revoke', {ticket}).catch(() => undefined); });
         await tickets.listen();
         run.tickets.push(tickets);
         let sessionFile: string | null = null;
@@ -480,9 +512,10 @@ export default function (pi: ExtensionAPI) {
       const duplicate = await duplicateOpenTask(run, message.arguments.title);
       if (duplicate) return {error: duplicate};
     }
+    // The worker waits 45 s for a ticket; the duplicate check (8 s) and the reservation (25 s) stay inside that.
     const reservation = await control('reserve', {
       agent_id: target.agentId, turn_id: target.turn, call_id: message.call_id, tool: message.tool, arguments: message.arguments,
-    });
+    }, 25000);
     if (typeof reservation.ticket !== 'string') return {error: 'Missing native invocation ticket.'};
     return {socket: run.bridge.ready.socket, ticket: reservation.ticket};
   }
@@ -526,7 +559,7 @@ export default function (pi: ExtensionAPI) {
   /** Peers plan at the same moment; a second task with an existing open title is refused with the original named. */
   async function duplicateOpenTask(current: Run, title: unknown): Promise<string | null> {
     let tasks: View['tasks']['items'];
-    try { tasks = (await fetchCollection(runtimeExecutable(), current.bridge.ready.run_id, current.sessionId, 'tasks')).tasks.items; }
+    try { tasks = (await fetchCollection(runtimeExecutable(), current.bridge.ready.run_id, current.sessionId, 'tasks', undefined, 8000)).tasks.items; }
     catch (error) { current.log('duplicate check skipped: ' + String((error as Error).message || error)); return null; }
     const existing = duplicateTask(title, tasks);
     if (!existing) return null;
@@ -765,20 +798,16 @@ export default function (pi: ExtensionAPI) {
       const stale = unfinishedRuns(ctx.cwd);
       if (!stale.length) { ctx.ui.notify('No unfinished DeLM run owns this project.', 'info'); return; }
       for (const item of stale) {
-        await new Promise<void>(done => {
-          const child = execFile(runtimeExecutable(), ['pi', 'recover', '--run-id', item.id], {timeout: 120000}, (error, stdout, stderr) => {
-            if (error) ctx.ui.notify('DeLM could not recover run ' + item.id.slice(0, 8) + ': ' + String(stderr || error.message).trim().slice(0, 300), 'error');
-            else {
-              let result: {status?: string; recovery?: {recovery?: string}} = {};
-              try { result = JSON.parse(String(stdout).trim().split('\n').at(-1) || '{}'); } catch { /* raw */ }
-              ctx.ui.notify('DeLM run ' + item.id.slice(0, 8) + ' recovered: ' + String(result.status || 'done')
-                + (result.recovery?.recovery ? '. Saved changes: ' + result.recovery.recovery : ''), 'info');
-            }
-            done();
-          });
-          child.stdin?.on('error', () => { /* The exit callback reports the outcome. */ });
-          child.stdin?.end('{}\n');
-        });
+        // A run this session started is recovered with its own capability; older runs need the tokenless path.
+        const own = lastFinished && lastFinished.bridge.ready.run_id === item.id ? lastFinished : null;
+        const body = own
+          ? {token: own.bridge.ready.token, session_id: own.sessionId, background_tasks_stopped: true,
+            agents: own.workers.map(w => ({id: w.agentId, status: w.status === 'running' ? 'killed' : w.status}))}
+          : {};
+        const result = await recoverRun(item.id, body);
+        if (result.ok) ctx.ui.notify('DeLM recovered: ' + result.message, 'info');
+        else ctx.ui.notify('DeLM could not recover run ' + item.id.slice(0, 8) + ': ' + result.message
+          + (own ? '' : ' If this Pi session started that run, quit Pi and run /delm:recover in a new session.'), 'error');
       }
     },
   });
@@ -826,7 +855,7 @@ export default function (pi: ExtensionAPI) {
     try { await controlOn(current, 'interrupt', {reason: 'Conversation ended'}, 2000); } catch { /* Recovery keeps the work. */ }
     // Pi waits for this handler without a bound; a stuck worker gets a short grace, then SIGKILL.
     await Promise.race([stopWorkers(current), new Promise(resolve => setTimeout(resolve, 6000))]);
-    for (const target of current.workers) { if (target.process.running) { try { target.process.child.kill('SIGKILL'); } catch { /* gone */ } } }
+    for (const target of current.workers) { if (target.process.alive) { try { target.process.child.kill('SIGKILL'); } catch { /* gone */ } } }
     await cleanup(current);
   });
 }

@@ -70,7 +70,7 @@ export function taskState(task: TaskItem, view: View): string {
 export function cleanText(value: unknown, limit = 4000): string {
   return String(value ?? '').replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
     .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, '')
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, '')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b\u200e\u200f\u2060\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
     .replace(/[\r\t\n]+/g, ' ').slice(0, limit);
 }
 
@@ -79,8 +79,9 @@ const segmenter = typeof Intl !== 'undefined' && 'Segmenter' in Intl ? new Intl.
 /** Terminal cells a grapheme occupies: two for East Asian wide and emoji presentation, else one. */
 function cellWidth(grapheme: string): number {
   const point = grapheme.codePointAt(0) ?? 0;
+  // A variation selector or keycap turns a text symbol into a two-cell emoji.
+  if (/[\ufe0f\u20e3]/u.test(grapheme) || /\p{Emoji_Presentation}/u.test(grapheme)) return 2;
   if (point < 0x1100) return 1;
-  if (/\p{Emoji_Presentation}/u.test(grapheme)) return 2;
   const wide = (point >= 0x1100 && point <= 0x115f) || (point >= 0x2e80 && point <= 0xa4cf) || (point >= 0xac00 && point <= 0xd7a3)
     || (point >= 0xf900 && point <= 0xfaff) || (point >= 0xfe30 && point <= 0xfe4f) || (point >= 0xff00 && point <= 0xff60)
     || (point >= 0xffe0 && point <= 0xffe6) || (point >= 0x20000 && point <= 0x3fffd);
@@ -265,10 +266,10 @@ export class BoardObserver {
 export const PAGE_LIMIT = 32;
 
 export function fetchCollection(executable: string, runId: string, sessionId: string, collection: 'tasks' | 'shared' | 'checks',
-  limit = PAGE_LIMIT): Promise<View> {
+  limit = PAGE_LIMIT, timeoutMs = 15000): Promise<View> {
   return new Promise((resolve, reject) => {
     execFile(executable, ['pi', 'view', '--run-id', runId, '--session-id', sessionId, '--collection', collection, '--limit', String(limit)],
-      {timeout: 15000, maxBuffer: 8 * 1024 * 1024}, (error, stdout, stderr) => {
+      {timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024}, (error, stdout, stderr) => {
         if (error) return reject(new Error(String(stderr || error.message).trim()));
         const line = String(stdout).split('\n').filter(item => item.trim()).at(-1);
         try { resolve(JSON.parse(line || '{}')); } catch (parseError) { reject(parseError as Error); }

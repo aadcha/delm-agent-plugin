@@ -66,6 +66,8 @@ test('an outcome reason survives the height cap and wide characters are measured
   assert.equal(fit('日本語テキスト', 7), '日本語…');
   assert.equal(fit('👩‍👩‍👧‍👦abc', 4), '👩‍👩‍👧‍👦a…', 'a wide cluster costs two cells and is never split');
   assert.equal(fit('plain', 10), 'plain');
+  assert.equal(fit('a\u200bb', 10), 'ab', 'zero-width characters are stripped');
+  assert.equal(fit('❤️xy', 3), '❤️…', 'a variation-selector emoji takes two cells');
 });
 
 test('agent and task states read like the Claude board', () => {

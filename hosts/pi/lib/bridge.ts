@@ -25,14 +25,15 @@ export class TicketServer {
   readonly path: string;
   private readonly server: Server;
 
-  constructor(path: string, handler: (message: TicketRequest | ReleaseRequest) => Promise<TicketReply | {released: boolean}>) {
+  constructor(path: string, handler: (message: TicketRequest | ReleaseRequest) => Promise<TicketReply | {released: boolean}>,
+    onOrphan: (ticket: string) => void = () => undefined) {
     this.path = path;
     this.server = createServer(socket => {
       let buffer = '';
       socket.setEncoding('utf8');
       socket.on('data', async chunk => {
         buffer += String(chunk);
-        if (buffer.length > LIMIT) { socket.destroy(); return; }
+        if (buffer.length > LIMIT) { socket.end(JSON.stringify({error: 'The coordination request is too large (over ' + LIMIT + ' bytes).'}) + '\n'); return; }
         const newline = buffer.indexOf('\n');
         if (newline < 0) return;
         const line = buffer.slice(0, newline);
@@ -42,6 +43,11 @@ export class TicketServer {
         let reply: TicketReply | {released: boolean};
         try { reply = await handler(message); }
         catch (error) { reply = {error: String((error as Error).message || error)}; }
+        if (socket.destroyed || !socket.writable) {
+          // The worker stopped waiting; a ticket it never received must not stay reserved.
+          if ('ticket' in reply && typeof reply.ticket === 'string') onOrphan(reply.ticket);
+          return;
+        }
         socket.end(JSON.stringify(reply) + '\n');
       });
       socket.on('error', () => { /* A worker that disconnects mid-request gets no ticket. */ });
