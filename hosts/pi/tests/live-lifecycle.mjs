@@ -3,7 +3,7 @@
 // Not part of `npm test`: each scenario starts real workers and bills the
 // provider login Pi is using. Run explicitly:
 //
-//   node hosts/pi/tests/live-lifecycle.mjs update|stop|recover|all [--package DIR]
+//   node hosts/pi/tests/live-lifecycle.mjs update|stop|recover|all [--package DIR] [--model provider/id]
 //
 // Evidence goes to .validation/pi-live/<scenario>-<timestamp>/.
 import {spawn, execFileSync} from 'node:child_process';
@@ -17,7 +17,11 @@ const ROOT = resolve(HERE, '../../..');
 const args = process.argv.slice(2);
 const packageIndex = args.indexOf('--package');
 const packageDir = packageIndex >= 0 ? resolve(args[packageIndex + 1]) : join(ROOT, '.build', 'plugin-pi');
-const positional = args.filter((a, i) => !a.startsWith('--') && i !== packageIndex + 1);
+// `--model provider/id` picks the parent's (and so the workers') model; a cheap one validates the mechanics.
+const modelIndex = args.indexOf('--model');
+const modelArgs = modelIndex >= 0 ? ['--model', args[modelIndex + 1]] : [];
+const valueSlots = new Set([packageIndex, modelIndex].filter(i => i >= 0).map(i => i + 1));
+const positional = args.filter((a, i) => !a.startsWith('--') && !valueSlots.has(i));
 const scenario = positional[0] || 'all';
 const runtime = join(packageDir, 'bin', 'delm');
 const extension = join(packageDir, 'extensions', 'delm.ts');
@@ -36,7 +40,7 @@ function project() {
 }
 
 function parent(dir, evidence) {
-  const child = spawn('pi', ['--mode', 'rpc', '--no-session', '-e', extension], {
+  const child = spawn('pi', ['--mode', 'rpc', '--no-session', ...modelArgs, '-e', extension], {
     cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, DELM_PI_RUNTIME: runtime, DELM_PI_WORKER: ''},
   });
   const records = [];
@@ -120,10 +124,11 @@ async function scenarioUpdate() {
     await sleep(20000);
     p.send({id: 'update', type: 'prompt', message: 'Also add a farewell(name) function returning "Goodbye, <name>!" with its own test.'});
     const forwarded = await p.waitFor(/forwarded your update/, 30000);
-    const final = await p.waitFor(/delivered the result|stopped|interrupted|Needs attention|DeLM:/, 600000);
+    const final = await p.waitFor(/delivered the result|DeLM stopped|run interrupted|could not start/, 600000);
     await sleep(2000);
     const hello = existsSync(join(dir, 'hello.py')) ? readFileSync(join(dir, 'hello.py'), 'utf8') : '';
-    results.update = {forwarded: Boolean(forwarded), final, farewellDelivered: /farewell/.test(hello), evidence};
+    results.update = {forwarded: Boolean(forwarded), final, farewellDelivered: /farewell/.test(hello),
+      errors: p.notices.filter(n => /^DeLM: /.test(n)), evidence};
   } finally {
     await stopParent(p);
     if (results.update) results.update.strays = strayWorkers(since);

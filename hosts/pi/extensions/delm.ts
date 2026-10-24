@@ -56,6 +56,8 @@ type Run = {
   applied: Set<string>;
   /** Set until both peers are bound and peer 1 is prompted; updates wait for it. */
   launching: boolean;
+  /** Set while an update is being registered; a step sent meanwhile would cite a stale revision. */
+  updating: boolean;
   failure: string | null;
   stopRequested: boolean;
   sessionDir: string;
@@ -236,8 +238,9 @@ export default function (pi: ExtensionAPI) {
         case 'message_end': {
           // The error is kept for the turn's outcome; whether the run stops is
           // decided at agent_end, after Pi has said whether it retries.
-          const message = event.message as {role?: string; stopReason?: string; errorMessage?: string} | undefined;
+          const message = event.message as {role?: string; stopReason?: string; errorMessage?: string; usage?: Record<string, unknown>} | undefined;
           if (message?.role !== 'assistant') return;
+          if (message.usage) current.log('worker ' + target.slot + ' usage ' + JSON.stringify(message.usage));
           if (message.stopReason !== 'error') { target.lastError = null; return; }   // a retried call succeeded
           target.lastError = String(message.errorMessage || 'the model returned an error');
           if (accountError(target.lastError)) await stopForModelError(current, target, target.lastError);
@@ -263,7 +266,7 @@ export default function (pi: ExtensionAPI) {
           if (target.turn) return;
           target.turn = randomUUID();
           // A worker still behind the request revision registers its turn on the first step after the update lands.
-          if (target.deliveredRevision !== current.revision) return;
+          if (current.updating || target.deliveredRevision !== current.revision) return;
           await controlOn(current, 'step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
           return;
         }
@@ -272,7 +275,7 @@ export default function (pi: ExtensionAPI) {
           // was steered into the run, the next call has it in context, so this
           // is where the worker acknowledges the new revision (as Claude does
           // on turn.step). A stale worker is skipped until its update lands.
-          if (!target.turn || target.deliveredRevision !== current.revision) return;
+          if (!target.turn || current.updating || target.deliveredRevision !== current.revision) return;
           await controlOn(current, 'step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
           return;
         }
@@ -319,8 +322,11 @@ export default function (pi: ExtensionAPI) {
           return;
       }
     } catch (error) {
+      const message = String((error as Error).message || error);
+      // A step that cites a revision the controller just moved past is retried on the worker's next model call.
+      if (/acknowledge the current task revision/i.test(message)) { current.log('worker ' + target.slot + ' step deferred: ' + message); return; }
       if (run === current && !current.finalization && !current.finished) {
-        current.failure = String((error as Error).message || error);
+        current.failure = message;
         notify('DeLM: ' + current.failure, 'error');
       }
     }
@@ -468,7 +474,7 @@ export default function (pi: ExtensionAPI) {
     const log = (line: string) => { try { appendFileSync(logFile, new Date().toISOString() + ' ' + line + '\n'); } catch { /* Diagnostics only. */ } };
     run = {
       sessionId, task, bridge, revision: bridge.ready.revision, workers: [], tickets: [], finalization: null,
-      settling: null, finished: false, final: null, applied: new Set(), launching: true, failure: null, stopRequested: false, sessionDir, log,
+      settling: null, finished: false, final: null, applied: new Set(), launching: true, updating: false, failure: null, stopRequested: false, sessionDir, log,
       modelErrorReported: false, observer: null, view: null, boardHidden: false, launchGate: null, bridgeExited: false,
     };
     const current = run;
@@ -867,13 +873,17 @@ export default function (pi: ExtensionAPI) {
     if (!run || run.finished) return;
     if (run.launching) throw new Error('DeLM is still starting its peers; send the update again in a moment.');
     const update = updateText(text);
-    // A waiting peer 2 gets its launch prompt first, so the update reaches it as a steer, not as its opening message.
-    if (run.launchGate) await run.launchGate.release();
-    const result = await control('update', {text: update});
-    run.revision = Number(result.revision) || run.revision;
-    run.finalization = null;
-    status('DeLM: revision ' + run.revision);
-    await applyActions((result.actions as Action[]) || []);
+    const current = run;
+    // The new revision is registered first, so no step cites the old one; a peer still waiting at the
+    // launch gate is then released and receives the update as a steer into its opening run.
+    current.updating = true;
+    let result;
+    try { result = await control('update', {text: update}); } finally { current.updating = false; }
+    current.revision = Number(result.revision) || current.revision;
+    current.finalization = null;
+    status('DeLM: revision ' + current.revision);
+    if (current.launchGate) await current.launchGate.release();
+    await applyActions((result.actions as Action[]) || [], current);
   }
 
   // While a run is working, ordinary text goes to the peers, not to the parent model.
