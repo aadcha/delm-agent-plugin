@@ -2249,7 +2249,12 @@ mod tests {
         let fractional = c.handle(json!({"op":"command_start","agent_id":"agent-1","turn_id":"turn-1","call_id":"call-frac","command":"true","cwd":cwd}))
             .and_then(|_| c.handle(json!({"op":"command_end","agent_id":"agent-1","call_id":"call-frac","result_ref":"call-frac","exit_code":1.5,
                 "is_error":false,"interrupted":false,"timed_out":false,"background_task_id":null})));
-        assert!(fractional.unwrap_err().to_string().contains("Invalid native exit code"));
+        assert!(
+            fractional
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid native exit code")
+        );
         assert!(matches!(
             c.workers[0].checks["call-aborted"].completion,
             CommandCompletion::NativeTool {
