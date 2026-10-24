@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {commandOutcome, coordinationTool, decodeLines, explainModelError, launchPrompt, toolArguments, turnReason, updateText, validateReady}
+import {commandOutcome, coordinationTool, decodeLines, duplicateTask, duplicateTaskReason, explainModelError, launchPrompt, toolArguments, turnReason, updateText, validateReady}
   from '../lib/protocol.ts';
 
 const ready = {
@@ -56,6 +56,9 @@ test('updates are bounded and the launch prompt carries the request', () => {
   assert.throws(() => updateText('x'.repeat(128 * 1024 + 1)));
   assert.match(updateText('fix it', ['see README']), /Additional context:\nsee README$/);
   assert.match(launchPrompt('Build a thing', 2), /peer 2 of 2[\s\S]*User request:\nBuild a thing$/);
+  assert.match(launchPrompt('Build a thing', 1), /share the initial task breakdown promptly/);
+  assert.match(launchPrompt('Build a thing', 2), /already lists your peer's initial task breakdown/);
+  assert.match(launchPrompt('Build a thing', 2, false), /has not shared a task breakdown yet/);
 });
 
 test('model refusals are explained with the fix, not the raw API body', () => {
@@ -65,4 +68,18 @@ test('model refusals are explained with the fix, not the raw API body', () => {
   assert.match(explainModelError('401 {"error":{"message":"invalid x-api-key"}}'), /rejected the login/);
   assert.match(explainModelError('429 rate_limit_error: too many requests'), /rate limiting/);
   assert.match(explainModelError('something odd happened'), /provider returned: something odd happened/);
+});
+
+test('a second task with an open title is detected regardless of case, spacing or punctuation', () => {
+  const tasks = [
+    {id: 3, task_number: 1, title: 'calc/ops.py + tests/test_ops.py', state: 'claimed', owner: 2},
+    {id: 4, task_number: 2, title: 'README', state: 'done', owner: 1},
+  ];
+  assert.equal(duplicateTask('Calc ops.py, tests test_ops.py', tasks)?.id, 3);
+  assert.equal(duplicateTask('readme', tasks), null, 'finished tasks never match');
+  assert.equal(duplicateTask('calc/cli.py', tasks), null);
+  assert.equal(duplicateTask('', tasks), null);
+  const reason = duplicateTaskReason(tasks[0], slot => 'Agent ' + slot);
+  assert.match(reason, /^A task with this title already exists: #1 "calc\/ops.py \+ tests\/test_ops.py" \(claimed by Agent 2, task_id 3\)/);
+  assert.match(duplicateTaskReason({...tasks[0], state: 'available', owner: null}, () => 'x'), /\(available, task_id 3\)/);
 });

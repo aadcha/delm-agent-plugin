@@ -13,7 +13,7 @@ import {execFile} from 'node:child_process';
 import {PiProcess, type RpcEvent} from '../lib/rpc.ts';
 import {TicketServer, bridgeRoot, type TicketRequest, type ReleaseRequest} from '../lib/bridge.ts';
 import {request, startBridge, type Action, type Bridge} from '../lib/control.ts';
-import {commandOutcome, explainModelError, hostNotes, launchPrompt, turnReason, updateText} from '../lib/protocol.ts';
+import {commandOutcome, duplicateTask, duplicateTaskReason, explainModelError, hostNotes, launchPrompt, turnReason, updateText} from '../lib/protocol.ts';
 import {BoardObserver, fetchCollection, renderBoard, renderCollection, type View} from '../lib/board.ts';
 import {existsSync, readdirSync} from 'node:fs';
 import {homedir} from 'node:os';
@@ -42,6 +42,8 @@ type Run = {
   revision: number;
   workers: Worker[];
   tickets: TicketServer[];
+  /** Peer 2's launch waits for the first shared task; an update releases it early. */
+  launchGate: {release: () => Promise<void>} | null;
   finalization: {generation: number; revision: number; intent: string} | null;
   settling: Promise<void> | null;
   finished: boolean;
@@ -331,7 +333,7 @@ export default function (pi: ExtensionAPI) {
     run = {
       sessionId, task, bridge, revision: bridge.ready.revision, workers: [], tickets: [], finalization: null,
       settling: null, finished: false, final: null, lastAction: null, failure: null, stopRequested: false, sessionDir, log,
-      modelErrorReported: false, observer: null, view: null, boardHidden: false,
+      modelErrorReported: false, observer: null, view: null, boardHidden: false, launchGate: null,
     };
     startBoard(ctx);
     log('run ' + bridge.ready.run_id + ' project ' + ctx.cwd + ' sessions ' + sessionDir);
@@ -384,9 +386,9 @@ export default function (pi: ExtensionAPI) {
         await control('bind', {slot, agent_id: target.agentId});
         await control('configure_scopes', {agent_id: target.agentId, scopes: [{path: cwd, access: 'write'}]});
       }
-      for (const target of run.workers) {
-        await target.process.prompt(launchPrompt(task, target.slot));
-      }
+      const [first, second] = run.workers;
+      await first.process.prompt(launchPrompt(task, 1));
+      gateSecondPeer(run, second, task);
     } catch (error) {
       try { await control('cancel', {reason: 'Native peer launch failed'}); } catch { /* Recovery retains the workspace. */ }
       await cleanup();
@@ -403,11 +405,59 @@ export default function (pi: ExtensionAPI) {
     }
     const target = run.workers[slot - 1];
     if (!target?.turn) return {error: 'The worker has no active native turn.'};
+    if (message.tool === 'delm_task_create') {
+      const duplicate = await duplicateOpenTask(run, message.arguments.title);
+      if (duplicate) return {error: duplicate};
+    }
     const reservation = await control('reserve', {
       agent_id: target.agentId, turn_id: target.turn, call_id: message.call_id, tool: message.tool, arguments: message.arguments,
     });
     if (typeof reservation.ticket !== 'string') return {error: 'Missing native invocation ticket.'};
     return {socket: run.bridge.ready.socket, ticket: reservation.ticket};
+  }
+
+  const LAUNCH_GATE_MS = 40000;
+
+  /** Peer 2 is prompted once peer 1 has shared a task, when an update arrives, or after the bounded wait. */
+  function gateSecondPeer(current: Run, second: Worker, task: string) {
+    let release: () => void = () => {};
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const launched = (async () => {
+      const planned = await firstTaskShared(current, released);
+      current.launchGate = null;
+      if (run !== current || current.finished) return;
+      current.log('worker 2 prompted ' + (planned ? 'after the first shared task' : 'without a shared task'));
+      try { await second.process.prompt(launchPrompt(task, 2, planned)); }
+      catch (error) { current.log('worker 2 launch prompt failed: ' + String((error as Error).message || error)); }
+    })();
+    current.launchGate = {release: () => { release(); return launched; }};
+  }
+
+  async function firstTaskShared(current: Run, released: Promise<void>): Promise<boolean> {
+    const deadline = Date.now() + LAUNCH_GATE_MS;
+    let open = true;
+    void released.then(() => { open = false; });
+    while (open && Date.now() < deadline && run === current && !current.finished) {
+      if ((current.view?.tasks.total ?? 0) > 0) return true;
+      try {
+        const page = await fetchCollection(runtimeExecutable(), current.bridge.ready.run_id, current.sessionId, 'tasks', 1);
+        if (page.tasks.total > 0) return true;
+      } catch (error) { current.log('launch gate check skipped: ' + String((error as Error).message || error)); }
+      await Promise.race([released, new Promise(resolve => setTimeout(resolve, 1000))]);
+    }
+    return false;
+  }
+
+  /** Peers plan at the same moment; a second task with an existing open title is refused with the original named. */
+  async function duplicateOpenTask(current: Run, title: unknown): Promise<string | null> {
+    let tasks: View['tasks']['items'];
+    try { tasks = (await fetchCollection(runtimeExecutable(), current.bridge.ready.run_id, current.sessionId, 'tasks')).tasks.items; }
+    catch (error) { current.log('duplicate check skipped: ' + String((error as Error).message || error)); return null; }
+    const existing = duplicateTask(title, tasks);
+    if (!existing) return null;
+    const agentName = (slot: number | null | undefined) => current.view?.agents.find(agent => agent.slot === slot)?.name || 'Agent ' + slot;
+    current.log('worker refused duplicate task "' + String(title) + '" (existing task ' + existing.id + ')');
+    return duplicateTaskReason(existing, agentName);
   }
 
   // ---- the live board ----------------------------------------------------------
@@ -649,6 +699,8 @@ export default function (pi: ExtensionAPI) {
   async function forward(text: string) {
     if (!run || run.finished) return;
     const update = updateText(text);
+    // A waiting peer 2 gets its launch prompt first, so the update reaches it as a steer, not as its opening message.
+    if (run.launchGate) await run.launchGate.release();
     const result = await control('update', {text: update});
     run.revision = Number(result.revision) || run.revision;
     run.finalization = null;

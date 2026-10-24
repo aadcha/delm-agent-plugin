@@ -7,6 +7,7 @@
 // waiting on worker 1 on every prompt. The scenario is selected by
 // DELM_PI_WORKER; the controller, sidecar and delivery are production code.
 import {spawn} from 'node:child_process';
+import {writeFileSync} from 'node:fs';
 import {connect} from 'node:net';
 import {createInterface} from 'node:readline';
 
@@ -104,6 +105,11 @@ async function run(prompt) {
   emit({type: 'turn_start'});
   try {
     if (slot === 1 && scenario === 'deliver') {
+      // Planning takes a moment; peer 2 must not be prompted before this task exists.
+      if (process.env.FAKE_PI_MARK) await new Promise(resolve => setTimeout(resolve, 2000));
+      await coordinate('delm_task_create', {idempotency_key: 'task-1-' + calls, title: 'Write hello.txt', description: 'Create hello.txt with a greeting.', kind: 'implementation'});
+      // Leave the run active long enough for peer 2's duplicate attempt to be judged.
+      if (process.env.FAKE_PI_MARK) await new Promise(resolve => setTimeout(resolve, 4000));
       const check = await bash("printf 'hello from delm\\n' > hello.txt && cat hello.txt");
       await coordinate('delm_complete', {
         idempotency_key: 'complete-1-' + calls, expected_revision: 1, outcome: 'complete',
@@ -111,6 +117,15 @@ async function run(prompt) {
       });
       lastText = 'Created hello.txt in the project and verified its contents.';
     } else {
+      if (scenario === 'deliver' && process.env.FAKE_PI_MARK) {
+        // Peer 1 shares its task first; the same title from peer 2 must be refused by the parent with the original named.
+        const board = await coordinate('delm_status', {});
+        const seen = board?.board?.tasks?.length ?? 0;
+        let refusal = 'not refused';
+        try { await coordinate('delm_task_create', {idempotency_key: 'task-2-' + calls, title: 'write hello.txt', description: 'Duplicate plan.', kind: 'implementation'}); }
+        catch (error) { refusal = error.message; }
+        writeFileSync(process.env.FAKE_PI_MARK, 'tasks_at_start=' + seen + '\nprompt=' + prompt.replace(/\n/g, ' ') + '\n' + refusal + '\n');
+      }
       await coordinate('delm_complete', {
         idempotency_key: 'waiting-' + slot + '-' + calls, expected_revision: 1, outcome: 'waiting',
         summary: 'Nothing independent remains; waiting for peer 1.', dependency: 'worker:1', checks: [], shared_checks: [], artifacts: [],

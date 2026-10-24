@@ -6,7 +6,7 @@ import test from 'node:test';
 import {spawn, execFileSync} from 'node:child_process';
 import {existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {dirname, join, resolve} from 'node:path';
+import {basename, dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -36,7 +36,7 @@ test('two fake Pi workers deliver a result into the original project', {skip, ti
   const parent = spawn(PI, ['--mode', 'rpc', '--no-session', '--no-extensions',
     '-e', join(PACKAGE, 'extensions', 'delm.ts')], {
     cwd: dir, stdio: ['pipe', 'pipe', 'pipe'],
-    env: {...process.env, DELM_PI_COMMAND: FAKE, DELM_PI_RUNTIME: RUNTIME, DELM_PI_WORKER: '', FAKE_PI_SCENARIO: 'deliver'},
+    env: {...process.env, DELM_PI_COMMAND: FAKE, DELM_PI_RUNTIME: RUNTIME, DELM_PI_WORKER: '', FAKE_PI_SCENARIO: 'deliver', FAKE_PI_MARK: join(dir, '..', basename(dir) + '-duplicate.txt')},
   });
   let stderr = '';
   parent.stderr.setEncoding('utf8');
@@ -69,6 +69,12 @@ test('two fake Pi workers deliver a result into the original project', {skip, ti
     assert.match(String(outcome), /delivered the result/, 'outcome: ' + outcome + '\nnotices: ' + notices.join(' | ') + '\nstderr: ' + stderr.slice(-3000));
     assert.equal(readFileSync(join(dir, 'hello.txt'), 'utf8'), 'hello from delm\n');
     assert.equal(readFileSync(join(dir, 'README.md'), 'utf8'), '# fixture\n');
+    const mark = join(dir, '..', basename(dir) + '-duplicate.txt');
+    const recorded = readFileSync(mark, 'utf8');
+    assert.match(recorded, /^tasks_at_start=1\n/, 'peer 2 was prompted only after the first shared task: ' + recorded);
+    assert.match(recorded, /already lists your peer's initial task breakdown/, 'peer 2 launch wording');
+    assert.match(recorded, /already exists: #1 "Write hello.txt" \((claimed by Agent 1|available)/, 'duplicate task refusal: ' + recorded);
+    rmSync(mark, {force: true});
   } finally {
     parent.stdin.end();
     await new Promise(resolveExit => { parent.once('exit', resolveExit); setTimeout(() => { parent.kill('SIGKILL'); resolveExit(); }, 10000); });

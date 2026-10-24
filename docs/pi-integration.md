@@ -56,6 +56,12 @@ the shared `plugin/worker.md` plus a short Pi note (tool prefix, how to end a tu
 extension registers the DeLM MCP server (`delm pi mcp`, `exposure: direct`) at `session_start`, so the
 model sees `mcp__delm__delm_publish` and the other coordination tools as ordinary tools.
 
+Peers that plan at the same moment create the same tasks twice, so the launch is staggered: peer 1 is
+prompted to open the board with the initial breakdown, and peer 2 is prompted once the first shared task
+exists, when the user sends an update, or after 40 seconds without one, with wording that says whether
+the board is already populated. As a backstop, the parent refuses a `delm_task_create` whose title
+matches an open task (ignoring case, spacing and punctuation) and names the existing task to claim.
+
 Each worker's RPC stdout is the parent's event source. `agent_start` binds a new native turn
 (`step`), `tool_execution_start`/`end` for `bash` record command evidence (`command_start`,
 `command_end` with the tool's `exit_code`), and `agent_settled` retires the turn (`turn_end` with the
@@ -133,6 +139,10 @@ Exercised so far:
   `/delm:recover` saved its changes and released the project. It bills the provider login and is run
   explicitly, not by `npm test`.
 
+- the staggered launch and duplicate-title refusal, in the fake-worker lifecycle test (peer 2 is prompted
+  only after peer 1's task exists and its same-title task is refused) and in one real run on 2026-10-24
+  whose queue held no duplicate titles; broader overlap between differently worded tasks remains model
+  judgment.
 - the interactive TUI, driven through a pseudo-terminal on Pi 1.4.0 (2026-10-24): `/delm:run` on a
   four-part package request filled the queue within ten seconds, `/delm:board tasks` opened the overlay
   and Esc closed it, `/delm:board hide` and `/delm:status` hid and reopened the board, `/delm:stop` left

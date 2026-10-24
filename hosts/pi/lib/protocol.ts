@@ -82,8 +82,36 @@ export function turnReason(settled: {aborted?: boolean}, exited: boolean): 'comp
 
 // The task text a worker receives as its first prompt. The collaboration
 // policy itself is appended to the system prompt, not repeated here.
-export function launchPrompt(task: string, slot: number): string {
-  return 'DeLM request for peer ' + slot + ' of 2. Follow the DeLM worker policy in your system prompt and begin useful work through the shared board now.\n\nUser request:\n' + task;
+export function launchPrompt(task: string, slot: number, planned = true): string {
+  // Peers that plan at the same moment create the same tasks twice, so peer 1 opens the board and
+  // peer 2 is prompted once the first task exists (`planned`), or after a bounded wait without one.
+  const planning = slot === 1
+    ? 'You open the board: share the initial task breakdown promptly (small, independent, claimable tasks), claim one, and start on it.'
+    : planned
+      ? 'The board already lists your peer\'s initial task breakdown. Read it, claim an available task, and create tasks only for work the board does not already list.'
+      : 'Your peer has not shared a task breakdown yet. Read the board first; if it still lists no tasks, share a small breakdown yourself, claim one task, and leave the rest available. Create tasks only for work the board does not already list.';
+  return 'DeLM request for peer ' + slot + ' of 2. Follow the DeLM worker policy in your system prompt and begin useful work through the shared board now. '
+    + planning + '\n\nUser request:\n' + task;
+}
+
+/** Titles compared without case, punctuation or spacing, so "calc/ops.py + tests" and "Calc ops.py tests" collide. */
+export function normalizeTitle(title: unknown): string {
+  return String(title ?? '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+export type OpenTask = {id: number; task_number?: number; title: string; state: string; owner?: number | null};
+
+/** The open task whose title duplicates `title`, if any; finished tasks never match. */
+export function duplicateTask<T extends OpenTask>(title: unknown, tasks: T[]): T | null {
+  const wanted = normalizeTitle(title);
+  if (!wanted) return null;
+  return tasks.find(task => !['done', 'completed'].includes(task.state) && normalizeTitle(task.title) === wanted) || null;
+}
+
+export function duplicateTaskReason(task: OpenTask, agentName: (slot: number | null | undefined) => string): string {
+  const owner = task.state === 'claimed' && task.owner != null ? 'claimed by ' + agentName(task.owner) : 'available';
+  return 'A task with this title already exists: #' + (task.task_number ?? task.id) + ' "' + task.title + '" (' + owner
+    + ', task_id ' + task.id + '). Claim it or create a task for different work; do not create it again.';
 }
 
 export function hostNotes(): string {
