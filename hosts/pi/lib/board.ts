@@ -74,13 +74,41 @@ export function cleanText(value: unknown, limit = 4000): string {
     .replace(/[\r\t\n]+/g, ' ').slice(0, limit);
 }
 
+const segmenter = typeof Intl !== 'undefined' && 'Segmenter' in Intl ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
+
+/** Terminal cells a grapheme occupies: two for East Asian wide and emoji presentation, else one. */
+function cellWidth(grapheme: string): number {
+  const point = grapheme.codePointAt(0) ?? 0;
+  if (point < 0x1100) return 1;
+  if (/\p{Emoji_Presentation}/u.test(grapheme)) return 2;
+  const wide = (point >= 0x1100 && point <= 0x115f) || (point >= 0x2e80 && point <= 0xa4cf) || (point >= 0xac00 && point <= 0xd7a3)
+    || (point >= 0xf900 && point <= 0xfaff) || (point >= 0xfe30 && point <= 0xfe4f) || (point >= 0xff00 && point <= 0xff60)
+    || (point >= 0xffe0 && point <= 0xffe6) || (point >= 0x20000 && point <= 0x3fffd);
+  return wide ? 2 : 1;
+}
+
+function graphemes(text: string): string[] {
+  return segmenter ? Array.from(segmenter.segment(text), item => item.segment) : Array.from(text);
+}
+
+/** Truncates to `width` terminal cells, never splitting a grapheme cluster. */
 export function fit(value: unknown, width: number): string {
   const text = cleanText(value);
   const cells = Math.max(0, Math.floor(width));
   if (!cells) return '';
-  const chars = Array.from(text);
-  if (chars.length <= cells) return text;
-  return chars.slice(0, Math.max(0, cells - 1)).join('') + '…';
+  const parts = graphemes(text);
+  let used = 0;
+  for (const part of parts) used += cellWidth(part);
+  if (used <= cells) return text;
+  let out = '';
+  used = 0;
+  for (const part of parts) {
+    const next = used + cellWidth(part);
+    if (next > cells - 1) break;
+    out += part;
+    used = next;
+  }
+  return out + '…';
 }
 
 function agentName(view: View, slot: unknown): string {
@@ -90,12 +118,13 @@ function agentName(view: View, slot: unknown): string {
 function outcomeLines(view: View): string[] {
   const outcome = view.outcome;
   if (!outcome) return [];
+  // Most informative first: when the board runs out of rows, the last lines go.
   const lines: string[] = [];
+  if (outcome.reason) lines.push(fit(outcome.reason, 100));
   if (outcome.delivered) lines.push('Changes applied to your project' + (outcome.changed_paths_count != null ? ' · ' + outcome.changed_paths_count + ' files' : '') + '.');
   if (outcome.verification_required) lines.push('A focused check is needed in the original project.');
   if (outcome.conflicts_total) lines.push(outcome.conflicts_total + ' conflicting edits were kept out; see the handoff.');
   if (outcome.recovery_saved && !outcome.delivered) lines.push('Unfinished changes were saved for recovery.');
-  if (outcome.reason) lines.push(fit(outcome.reason, 100));
   return lines;
 }
 
@@ -128,20 +157,23 @@ export function renderBoard(view: View, width: number, rows = WIDGET_ROWS, hint 
   const done = view.tasks.items.filter(task => ['done', 'completed'].includes(task.state));
   const ordered = [...open, ...done];
   // The queue takes whatever height the fixed sections leave; the hint goes first when even one task would not fit.
-  const fixed = head.length + 1 + sharedLines.length + outcome.length;
+  const placeholder = ordered.length ? 0 : 1;
+  const fixed = head.length + 1 + placeholder + sharedLines.length + outcome.length;
   let budget = Math.min(4, rows - fixed - hintLines.length);
   if (budget < 1 && ordered.length && hintLines.length) { hintLines.length = 0; budget = Math.min(4, rows - fixed); }
   const shown = ordered.slice(0, Math.max(0, budget));
   const queue = ['Task queue · ' + view.tasks.total + (view.tasks.total > shown.length ? ' · ' + shown.length + ' shown' : '')];
-  if (!shown.length && !ordered.length) queue.push('  ' + (unavailable.includes('board') ? 'Tasks temporarily unavailable' : 'No tasks shared yet'));
+  if (!ordered.length) queue.push('  ' + (unavailable.includes('board') ? 'Tasks temporarily unavailable' : 'No tasks shared yet'));
   for (const task of shown) {
     const tail = ' · ' + taskState(task, view);
     const prefix = '  ' + taskLabel(task) + ' ';
     queue.push(prefix + fit(task.title, Math.max(1, inner - prefix.length - tail.length)) + tail);
   }
-  const lines = [...head, ...queue, ...sharedLines, ...outcome, ...hintLines];
-  // Pi appends its own truncation notice beyond `rows`, so the board drops its least important lines instead.
-  while (lines.length > rows && hintLines.length) { lines.pop(); hintLines.pop(); }
+  // Pi appends its own truncation notice beyond `rows`, so the board sheds its least important
+  // lines instead: the hint, then the shared-context detail, then trailing outcome lines.
+  let lines = [...head, ...queue, ...sharedLines, ...outcome, ...hintLines];
+  if (lines.length > rows && hintLines.length) lines = [...head, ...queue, ...sharedLines, ...outcome];
+  if (lines.length > rows && sharedLines.length > 1) lines = [...head, ...queue, sharedLines[0], ...outcome];
   return lines.slice(0, rows).map(line => fit(line, width));
 }
 
@@ -208,9 +240,14 @@ export class BoardObserver {
         try { onView(JSON.parse(line)); } catch { /* A partial record is skipped. */ }
       }
     });
-    child.once('exit', code => {
+    child.once('error', error => {
+      if (this.child === child) this.child = null;
+      onError('board observer could not start: ' + error.message);
+    });
+    child.once('exit', (code, signal) => {
       if (this.child === child) this.child = null;
       if (code && stderr.trim()) onError(stderr.trim());
+      else if (signal && signal !== 'SIGTERM') onError('board observer ended by ' + signal);
     });
   }
 

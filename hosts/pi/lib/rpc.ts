@@ -19,34 +19,48 @@ export class PiProcess {
   private readonly listeners = new Set<(event: RpcEvent) => void>();
   private exitCode: number | null = null;
   private exitSignal: NodeJS.Signals | null = null;
+  private spawnError: Error | null = null;
+  private discarding = false;
   readonly exited: Promise<{code: number | null; signal: NodeJS.Signals | null}>;
 
   constructor(command: string, args: string[], options: {cwd: string; env: NodeJS.ProcessEnv}) {
     this.child = spawn(command, args, {
       cwd: options.cwd, env: options.env, stdio: ['pipe', 'pipe', 'pipe'], shell: false,
     });
-    if (!this.child.pid) throw new Error('Pi worker did not start.');
-    this.pid = this.child.pid;
-    this.child.stdout!.setEncoding('utf8');
-    this.child.stdout!.on('data', chunk => this.receive(String(chunk)));
-    this.child.stderr!.setEncoding('utf8');
-    this.child.stderr!.on('data', chunk => { this.stderrTail = (this.stderrTail + String(chunk)).slice(-8192); });
-    this.exited = new Promise(resolve => {
-      this.child.once('exit', (code, signal) => {
-        this.exitCode = code; this.exitSignal = signal;
-        const error = new Error('Pi worker exited' + (this.stderrTail.trim() ? ': ' + this.stderrTail.trim() : '.'));
-        for (const waiter of this.pending.values()) waiter.reject(error);
-        this.pending.clear();
-        resolve({code, signal});
-      });
-      this.child.once('error', error => {
-        for (const waiter of this.pending.values()) waiter.reject(error);
-        this.pending.clear();
-      });
+    // A missing executable reports asynchronously; a closed pipe reports on the
+    // stream. Both are plain failures of this worker, never uncaught errors in
+    // the parent session.
+    let settled: ((value: {code: number | null; signal: NodeJS.Signals | null}) => void) | null = null;
+    this.exited = new Promise(resolve => { settled = resolve; });
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (this.exitCode !== null || this.exitSignal !== null || this.spawnError) return;
+      this.exitCode = code; this.exitSignal = signal;
+      const error = new Error('Pi worker exited' + (this.stderrTail.trim() ? ': ' + this.stderrTail.trim() : '.'));
+      for (const waiter of this.pending.values()) waiter.reject(error);
+      this.pending.clear();
+      settled?.({code, signal});
+    };
+    this.child.once('exit', (code, signal) => finish(code, signal));
+    this.child.on('error', error => {
+      this.spawnError = this.spawnError || error;
+      for (const waiter of this.pending.values()) waiter.reject(error);
+      this.pending.clear();
+      settled?.({code: null, signal: null});
     });
+    this.child.stdin?.on('error', error => {
+      for (const waiter of this.pending.values()) waiter.reject(error);
+      this.pending.clear();
+    });
+    this.pid = this.child.pid ?? 0;
+    this.child.stdout?.setEncoding('utf8');
+    this.child.stdout?.on('data', chunk => this.receive(String(chunk)));
+    this.child.stdout?.on('error', () => { /* The exit handler reports the worker. */ });
+    this.child.stderr?.setEncoding('utf8');
+    this.child.stderr?.on('data', chunk => { this.stderrTail = (this.stderrTail + String(chunk)).slice(-8192); });
+    this.child.stderr?.on('error', () => { /* Diagnostics only. */ });
   }
 
-  get running(): boolean { return this.exitCode === null && this.exitSignal === null && !this.child.killed; }
+  get running(): boolean { return this.pid > 0 && !this.spawnError && this.exitCode === null && this.exitSignal === null && !this.child.killed; }
   get stderr(): string { return this.stderrTail; }
 
   onEvent(listener: (event: RpcEvent) => void): () => void {
@@ -55,10 +69,18 @@ export class PiProcess {
   }
 
   private receive(chunk: string): void {
+    if (this.discarding) {
+      // The rest of an oversized record is dropped up to its line end.
+      const end = chunk.indexOf('\n');
+      if (end < 0) return;
+      this.discarding = false;
+      chunk = chunk.slice(end + 1);
+    }
     this.buffer += chunk;
-    if (this.buffer.length > LIMIT) {
+    if (this.buffer.length > LIMIT && !this.buffer.includes('\n')) {
       this.buffer = '';
-      this.fail(new Error('Pi worker exceeded the event size limit.'));
+      this.discarding = true;
+      this.stderrTail = (this.stderrTail + '\n[delm] an event over ' + LIMIT + ' bytes was discarded').slice(-8192);
       return;
     }
     const lines = this.buffer.split('\n');
@@ -83,13 +105,8 @@ export class PiProcess {
     }
   }
 
-  private fail(error: Error): void {
-    for (const waiter of this.pending.values()) waiter.reject(error);
-    this.pending.clear();
-    this.child.kill('SIGTERM');
-  }
-
   send<T = unknown>(command: Record<string, unknown>, timeoutMs = 30000): Promise<T> {
+    if (this.spawnError) return Promise.reject(new Error('Pi worker could not start: ' + this.spawnError.message));
     if (!this.running || !this.child.stdin?.writable) return Promise.reject(new Error('Pi worker is not running.'));
     const id = 'delm-' + (++this.sequence);
     return new Promise<T>((resolve, reject) => {
@@ -114,6 +131,11 @@ export class PiProcess {
   steer(message: string): Promise<{disposition: string}> { return this.send({type: 'steer', message}); }
   followUp(message: string): Promise<{disposition: string}> { return this.send({type: 'follow_up', message}); }
   abort(): Promise<void> { return this.send({type: 'abort'}, 10000).then(() => undefined); }
+  /** Answers a worker-side dialog request as cancelled; nobody is there to answer it. */
+  cancelUiRequest(id: unknown): void {
+    if (!this.running || !this.child.stdin?.writable) return;
+    try { this.child.stdin.write(JSON.stringify({type: 'extension_ui_response', id, cancelled: true}) + '\n', () => undefined); } catch { /* exiting */ }
+  }
   state(): Promise<Record<string, unknown>> { return this.send({type: 'get_state'}); }
   lastAssistantText(): Promise<string | null> {
     return this.send<{text: string | null}>({type: 'get_last_assistant_text'}).then(data => data?.text ?? null);

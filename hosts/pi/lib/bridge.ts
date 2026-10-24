@@ -64,7 +64,7 @@ export class TicketServer {
 }
 
 // Worker side. Returns the controller socket and a ticket, or throws.
-export function requestTicket(path: string, message: TicketRequest | ReleaseRequest, timeoutMs = 10000): Promise<TicketReply | {released: boolean}> {
+export function requestTicket(path: string, message: TicketRequest | ReleaseRequest, timeoutMs = 45000): Promise<TicketReply | {released: boolean}> {
   return new Promise((resolve, reject) => {
     const socket = connect(path);
     let buffer = '';

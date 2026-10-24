@@ -41,9 +41,9 @@ Install [Pi](https://pi.dev) (`npm install -g --ignore-scripts @earendil-works/p
 pi install "$PWD/.build/plugin-pi"
 ```
 
-The build stages `.build/plugin-pi/` with the runtime, both extensions, the shared worker policy and the manifest, and checks the TypeScript syntax with Node. Pi loads the package from that path in place; rebuild and start a new Pi session to pick up changes. Open the intended project in `pi` and invoke `/delm:run <task>`; `/delm:status` and `/delm:stop` are the other commands. `pi remove "$PWD/.build/plugin-pi"` uninstalls it. Pi resources live in `hosts/pi/`; the controller is shared with Claude Code (`delm pi serve`, see [Pi integration](pi-integration.md)).
+The build stages `.build/plugin-pi/` with the runtime, both extensions, the shared worker policy and the manifest, and checks the TypeScript syntax with Node. Pi loads the package from that path in place; rebuild and start a new Pi session to pick up changes. Open the intended project in `pi` and invoke `/delm:run <task>`; the other commands are `/delm:status`, `/delm:stop`, `/delm:board [hide|tasks|shared|checks]` and `/delm:recover`. `pi remove "$PWD/.build/plugin-pi"` uninstalls it. Pi resources live in `hosts/pi/`; the controller is shared with Claude Code (`delm pi serve`, see [Pi integration](pi-integration.md)).
 
-For one session without installing, use `pi -e /absolute/path/to/this-checkout/hosts/pi/extensions/delm.ts` with `DELM_PI_RUNTIME` pointing at a built runtime; the worker extension is loaded by path into each worker.
+For one session without installing, use `pi -e /absolute/path/to/this-checkout/hosts/pi/extensions/delm.ts` with `DELM_PI_RUNTIME` pointing at a built runtime; the worker extension is loaded by path into each worker. With the package also installed, the second copy of each extension no-ops, so `pi remove` is not required. The checkout's `hosts/pi/worker.md` is a development copy of `plugin/worker.md`; the build stages the shared file and the unit tests fail if the copies drift.
 
 Account-backed lifecycle checks, run explicitly because they start real workers on the provider login Pi uses:
 
@@ -51,7 +51,7 @@ Account-backed lifecycle checks, run explicitly because they start real workers 
 node hosts/pi/tests/live-lifecycle.mjs all
 ```
 
-Scenarios: `update` (a typed update reaches both peers mid-run), `stop` (`/delm:stop` saves unfinished changes and leaves no workers), `recover` (the parent is killed, a new session reports the unfinished run and `/delm:recover` releases it). Evidence lands in `.validation/pi-live/`.
+Scenarios: `update` (a typed update reaches both peers mid-run), `stop` (`/delm:stop` saves unfinished changes and leaves no worker process, checked by pid), `recover` (the parent is killed, a new session reports the unfinished run and `/delm:recover` releases it). Evidence lands in `.validation/pi-live/`.
 
 The npm installer does not manage Pi yet: a Pi package is installed from npm or a git ref, and the runtime binary must ship inside it, which needs its own release step.
 
@@ -65,7 +65,7 @@ The npm installer does not manage Pi yet: a Pi package is installed from npm or 
 ./scripts/verify.sh
 ```
 
-This runs Rust formatting, linting, and tests; Python packaging and qualification-helper tests; installer tests; and Claude module tests. Pi host tests run separately with `npm --prefix hosts/pi test`: unit tests for the host protocol helpers, and a model-free lifecycle fixture that drives the real parent extension under the installed `pi` in RPC mode with two scripted workers against the real controller, sidecar and delivery (skipped when `pi` or a debug runtime is missing). The deterministic suites cover task ownership, publication/import checks, shared verification, service ownership, guarded original-project delivery, recovery, and cleanup.
+This runs Rust formatting, linting, and tests; Python packaging and qualification-helper tests; installer tests; and Claude module tests. It also runs the Pi host tests (`npm --prefix hosts/pi test` runs them alone): unit tests for the host protocol helpers, and a model-free lifecycle fixture that drives the real parent extension under the installed `pi` in RPC mode with two scripted workers against the real controller, sidecar and delivery (skipped when `pi` or a debug runtime is missing). The deterministic suites cover task ownership, publication/import checks, shared verification, service ownership, guarded original-project delivery, recovery, and cleanup.
 
 CI tests the configured Codex and Claude versions on native Apple Silicon and Intel runners, and their latest versions together on Apple Silicon. Host upgrades must pass the same model-free checks, including the production Codex invocation below. A passing schema or installation check alone does not establish working startup. Support applies to the exact host version, architecture, source, and runtime covered by passing evidence; a latest-version job does not establish support before it passes.
 

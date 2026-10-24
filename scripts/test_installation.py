@@ -32,13 +32,16 @@ def executable(path, content):
     path.chmod(0o755)
 
 
-def fixture_runtime(path, version="fixture", board=True):
+def fixture_runtime(path, version="fixture", board=True, pi=True):
     replies = [
         {"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "delm"}}},
         {"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": name} for name in
             ["delm_status", "delm_complete", "delm_service"]]}},
     ]
     script = '#!/bin/sh\n'
+    if pi:
+        script += ('if [ "$1" = pi ] && [ "$2" = view ]; then\n'
+                   "echo '--run-id --session-id --watch --interval-ms --collection --limit'\nexit 0\nfi\n")
     if board:
         script += ('if [ "$1" = claude ] && [ "$2" = view ]; then\n'
                    "echo '--run-id --session-id --watch --interval-ms --collection --through-sequence --item-id'\nexit 0\nfi\n")
@@ -655,6 +658,16 @@ class BuildTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), \
                  self.assertRaisesRegex(RuntimeError, "exactly the two DeLM extensions"):
                 build.build(source, runtime, host="pi")
+
+    def test_runtime_without_the_pi_host_cannot_stage_the_pi_package(self):
+        with tempfile.TemporaryDirectory(prefix="delm pi build ") as temporary:
+            source = fixture_source(Path(temporary) / "source")
+            runtime = Path(temporary) / "runtime"
+            fixture_runtime(runtime, pi=False)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaisesRegex(RuntimeError, "does not provide the Pi host commands"):
+                build.build(source, runtime, host="pi")
+            self.assertFalse((source / ".build/plugin-pi").exists())
 
     def test_old_same_version_runtime_cannot_activate_claude_package(self):
         with tempfile.TemporaryDirectory() as temporary:

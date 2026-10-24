@@ -185,7 +185,7 @@ impl Controller {
         // Keep the project lock outside fallible construction, including failure
         // recovery. No native identity or launch path has been published yet.
         let saved = serde_json::to_value(&workspace)?;
-        let failure_record = json!({"version":1,"host":"claude","session_id":session_id,"task":task,
+        let failure_record = json!({"version":1,"host":host_name(host),"session_id":session_id,"task":task,
             "project":workspace.original,"workspace":saved,"runtime":runtime,"native_host":native_host});
         match Self::assemble(host, workspace, session_id, task, native_host, runtime) {
             Ok(mut controller) => {
@@ -788,13 +788,14 @@ impl Controller {
             self.workers[i].turn_id.as_deref() == Some(&started.turn_id),
             "Native command belongs to a retired turn"
         );
-        let completion = if self.host == NativeHost::Pi && r.get("exit_code").is_some() {
+        let exit_code = r.get("exit_code").filter(|value| !value.is_null());
+        let completion = if self.host == NativeHost::Pi && exit_code.is_some() {
             // Pi's bash tool reports the shell's exit status; a thrown abort or
-            // timeout returns no exit code and is recorded as a tool result.
+            // timeout sends a null exit code and is recorded as a tool result.
             CommandCompletion::NativeProcess {
                 status: crate::evidence::ProcessStatus::Completed,
-                exit_code: r["exit_code"]
-                    .as_i64()
+                exit_code: exit_code
+                    .and_then(Value::as_i64)
                     .context("Invalid native exit code")?,
             }
         } else {
@@ -2240,10 +2241,15 @@ mod tests {
                 .validate_for("call-bad", 1)
                 .unwrap()
         );
-        // Without an exit code the Pi host falls back to the tool-result record.
+        // An aborted or timed-out command arrives with a null exit code, as the
+        // Pi host sends it, and falls back to the tool-result record.
         c.handle(json!({"op":"command_start","agent_id":"agent-1","turn_id":"turn-1","call_id":"call-aborted","command":"sleep 99","cwd":cwd})).unwrap();
-        c.handle(json!({"op":"command_end","agent_id":"agent-1","call_id":"call-aborted","result_ref":"call-aborted",
+        c.handle(json!({"op":"command_end","agent_id":"agent-1","call_id":"call-aborted","result_ref":"call-aborted","exit_code":null,
             "is_error":true,"interrupted":true,"timed_out":false,"background_task_id":null})).unwrap();
+        let fractional = c.handle(json!({"op":"command_start","agent_id":"agent-1","turn_id":"turn-1","call_id":"call-frac","command":"true","cwd":cwd}))
+            .and_then(|_| c.handle(json!({"op":"command_end","agent_id":"agent-1","call_id":"call-frac","result_ref":"call-frac","exit_code":1.5,
+                "is_error":false,"interrupted":false,"timed_out":false,"background_task_id":null})));
+        assert!(fractional.unwrap_err().to_string().contains("Invalid native exit code"));
         assert!(matches!(
             c.workers[0].checks["call-aborted"].completion,
             CommandCompletion::NativeTool {

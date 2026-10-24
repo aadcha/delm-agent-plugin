@@ -7,7 +7,7 @@
 //
 // Evidence goes to .validation/pi-live/<scenario>-<timestamp>/.
 import {spawn, execFileSync} from 'node:child_process';
-import {existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, realpathSync} from 'node:fs';
+import {existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, realpathSync, statSync} from 'node:fs';
 import {tmpdir, homedir} from 'node:os';
 import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -15,8 +15,10 @@ import {fileURLToPath} from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '../../..');
 const args = process.argv.slice(2);
-const scenario = args.find(a => !a.startsWith('--')) || 'all';
-const packageDir = args.includes('--package') ? resolve(args[args.indexOf('--package') + 1]) : join(ROOT, '.build', 'plugin-pi');
+const packageIndex = args.indexOf('--package');
+const packageDir = packageIndex >= 0 ? resolve(args[packageIndex + 1]) : join(ROOT, '.build', 'plugin-pi');
+const positional = args.filter((a, i) => !a.startsWith('--') && i !== packageIndex + 1);
+const scenario = positional[0] || 'all';
 const runtime = join(packageDir, 'bin', 'delm');
 const extension = join(packageDir, 'extensions', 'delm.ts');
 if (!existsSync(runtime) || !existsSync(extension)) throw new Error('Build the Pi package first: ./scripts/build.sh --host pi');
@@ -75,9 +77,21 @@ function parent(dir, evidence) {
   return {child, send, waitFor, notices, finish};
 }
 
-function strayWorkers() {
+// Pi's RPC processes retitle themselves, so argv is useless; the parent logs every worker pid.
+function strayWorkers(since) {
+  const alive = [];
+  const sessions = readdirSync(tmpdir()).filter(name => name.startsWith('delm-pi-sessions-')).map(name => join(tmpdir(), name))
+    .filter(dir => { try { return statSync(dir).mtimeMs >= since; } catch { return false; } });
+  for (const dir of sessions) {
+    let log = '';
+    try { log = readFileSync(join(dir, 'delm-pi.log'), 'utf8'); } catch { continue; }
+    for (const match of log.matchAll(/worker (\d) pid (\d+)/g)) {
+      const pid = Number(match[2]);
+      try { process.kill(pid, 0); alive.push('worker ' + match[1] + ' pid ' + pid + ' (' + dir + ')'); } catch { /* exited */ }
+    }
+  }
   const out = execFileSync('ps', ['-eo', 'pid,command'], {encoding: 'utf8'});
-  return out.split('\n').filter(line => /pi --mode rpc --session-dir/.test(line) || /delm pi serve/.test(line));
+  return alive.concat(out.split('\n').filter(line => /delm pi serve/.test(line)));
 }
 
 function unfinishedRuns(dir) {
@@ -91,66 +105,86 @@ function unfinishedRuns(dir) {
 const TASK = 'Add hello.py with a greet(name) function that returns "Hello, <name>!" and a pytest test for it. Keep it minimal.';
 const results = {};
 
+const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
+const evidenceDir = name => { const dir = join(evidenceRoot, name + '-' + stamp()); mkdirSync(dir, {recursive: true}); return dir; };
+const stopParent = async p => { try { p.child.stdin.end(); } catch { /* closed */ } await sleep(3000); if (p.child.exitCode === null) p.child.kill('SIGKILL'); p.finish(); };
+
 async function scenarioUpdate() {
-  const dir = project(); const evidence = mkdtempSync(join(evidenceRoot, 'update-'));
+  const dir = project(); const evidence = evidenceDir('update'); const since = Date.now();
   console.log('update: project ' + dir);
   const p = parent(dir, evidence);
-  p.send({id: 'run', type: 'prompt', message: '/delm:run ' + TASK});
-  const started = await p.waitFor(/started two peers/, 60000);
-  if (!started) throw new Error('run did not start: ' + p.notices.join(' | '));
-  await sleep(20000);
-  p.send({id: 'update', type: 'prompt', message: 'Also add a farewell(name) function returning "Goodbye, <name>!" with its own test.'});
-  const forwarded = await p.waitFor(/forwarded your update/, 30000);
-  const final = await p.waitFor(/delivered the result|stopped|Needs attention|DeLM:/, 600000);
-  await sleep(2000);
-  p.child.stdin.end(); await sleep(3000); p.finish();
-  const hello = existsSync(join(dir, 'hello.py')) ? readFileSync(join(dir, 'hello.py'), 'utf8') : '';
-  results.update = {forwarded: Boolean(forwarded), final, farewellDelivered: /farewell/.test(hello), strays: strayWorkers(), evidence};
-  console.log('update:', JSON.stringify(results.update, null, 1));
+  try {
+    p.send({id: 'run', type: 'prompt', message: '/delm:run ' + TASK});
+    const started = await p.waitFor(/started two peers/, 60000);
+    if (!started) throw new Error('run did not start: ' + p.notices.join(' | '));
+    await sleep(20000);
+    p.send({id: 'update', type: 'prompt', message: 'Also add a farewell(name) function returning "Goodbye, <name>!" with its own test.'});
+    const forwarded = await p.waitFor(/forwarded your update/, 30000);
+    const final = await p.waitFor(/delivered the result|stopped|interrupted|Needs attention|DeLM:/, 600000);
+    await sleep(2000);
+    const hello = existsSync(join(dir, 'hello.py')) ? readFileSync(join(dir, 'hello.py'), 'utf8') : '';
+    results.update = {forwarded: Boolean(forwarded), final, farewellDelivered: /farewell/.test(hello), evidence};
+  } finally {
+    await stopParent(p);
+    if (results.update) results.update.strays = strayWorkers(since);
+    console.log('update:', JSON.stringify(results.update, null, 1));
+  }
 }
 
 async function scenarioStop() {
-  const dir = project(); const evidence = mkdtempSync(join(evidenceRoot, 'stop-'));
+  const dir = project(); const evidence = evidenceDir('stop'); const since = Date.now();
   console.log('stop: project ' + dir);
   const p = parent(dir, evidence);
-  p.send({id: 'run', type: 'prompt', message: '/delm:run ' + TASK});
-  if (!await p.waitFor(/started two peers/, 60000)) throw new Error('run did not start: ' + p.notices.join(' | '));
-  await sleep(15000);
-  p.send({id: 'stop', type: 'prompt', message: '/delm:stop'});
-  const final = await p.waitFor(/stopped|Stopped|saved|delivered/, 180000);
-  await sleep(2000);
-  p.child.stdin.end(); await sleep(3000); p.finish();
-  results.stop = {final, projectStatus: git(dir, 'status', '--short').trim(), strays: strayWorkers(), unfinished: unfinishedRuns(dir), evidence};
-  console.log('stop:', JSON.stringify(results.stop, null, 1));
+  try {
+    p.send({id: 'run', type: 'prompt', message: '/delm:run ' + TASK});
+    if (!await p.waitFor(/started two peers/, 60000)) throw new Error('run did not start: ' + p.notices.join(' | '));
+    await sleep(15000);
+    p.send({id: 'stop', type: 'prompt', message: '/delm:stop'});
+    const final = await p.waitFor(/stopped|Stopped|saved|delivered|interrupted/, 180000);
+    await sleep(2000);
+    results.stop = {final, projectStatus: git(dir, 'status', '--short').trim(), unfinished: unfinishedRuns(dir), evidence};
+  } finally {
+    await stopParent(p);
+    if (results.stop) results.stop.strays = strayWorkers(since);
+    console.log('stop:', JSON.stringify(results.stop, null, 1));
+  }
 }
 
 async function scenarioRecover() {
-  const dir = project(); const evidence = mkdtempSync(join(evidenceRoot, 'recover-'));
+  const dir = project(); const evidence = evidenceDir('recover'); const since = Date.now();
   console.log('recover: project ' + dir);
   const p = parent(dir, evidence);
-  p.send({id: 'run', type: 'prompt', message: '/delm:run ' + TASK});
-  if (!await p.waitFor(/started two peers/, 60000)) throw new Error('run did not start: ' + p.notices.join(' | '));
-  await sleep(15000);
-  p.child.kill('SIGKILL');            // the session dies without any shutdown handler
-  await sleep(8000); p.finish();
-  const straysAfterKill = strayWorkers();
-  const unfinishedBefore = unfinishedRuns(dir);
-  const q = parent(dir, evidence);
-  const warned = await q.waitFor(/unfinished DeLM run owns this project/, 20000);
-  q.send({id: 'recover', type: 'prompt', message: '/delm:recover'});
-  const recovered = await q.waitFor(/recovered|could not recover/, 180000);
-  await sleep(1000);
-  q.child.stdin.end(); await sleep(3000);
-  writeFileSync(join(evidence, 'recovery-records.jsonl'), q.notices.join('\n') + '\n');
-  results.recover = {straysAfterKill, unfinishedBefore, warned: Boolean(warned), recovered, unfinishedAfter: unfinishedRuns(dir),
-    projectStatus: git(dir, 'status', '--short').trim(), evidence};
-  console.log('recover:', JSON.stringify(results.recover, null, 1));
+  let q = null;
+  try {
+    p.send({id: 'run', type: 'prompt', message: '/delm:run ' + TASK});
+    if (!await p.waitFor(/started two peers/, 60000)) throw new Error('run did not start: ' + p.notices.join(' | '));
+    await sleep(15000);
+    p.child.kill('SIGKILL');            // the session dies without any shutdown handler
+    await sleep(8000); p.finish();
+    const straysAfterKill = strayWorkers(since);
+    const unfinishedBefore = unfinishedRuns(dir);
+    q = parent(dir, join(evidence, 'second-session'));
+    mkdirSync(join(evidence, 'second-session'), {recursive: true});
+    const warned = await q.waitFor(/unfinished DeLM run owns this project/, 20000);
+    q.send({id: 'recover', type: 'prompt', message: '/delm:recover'});
+    const recovered = await q.waitFor(/recovered|could not recover/, 180000);
+    await sleep(1000);
+    results.recover = {straysAfterKill, unfinishedBefore, warned: Boolean(warned), recovered, unfinishedAfter: unfinishedRuns(dir),
+      projectStatus: git(dir, 'status', '--short').trim(), evidence};
+  } finally {
+    if (p.child.exitCode === null) p.child.kill('SIGKILL');
+    if (q) await stopParent(q);
+    console.log('recover:', JSON.stringify(results.recover, null, 1));
+  }
 }
 
 const scenarios = {update: scenarioUpdate, stop: scenarioStop, recover: scenarioRecover};
-for (const name of scenario === 'all' ? Object.keys(scenarios) : [scenario]) {
-  if (!scenarios[name]) throw new Error('Unknown scenario ' + name);
-  await scenarios[name]();
+try {
+  for (const name of scenario === 'all' ? Object.keys(scenarios) : [scenario]) {
+    if (!scenarios[name]) throw new Error('Unknown scenario ' + name);
+    await scenarios[name]();
+  }
+} finally {
+  writeFileSync(join(evidenceRoot, 'latest.json'), JSON.stringify(results, null, 2));
 }
-writeFileSync(join(evidenceRoot, 'latest.json'), JSON.stringify(results, null, 2));
 console.log('evidence: ' + evidenceRoot);

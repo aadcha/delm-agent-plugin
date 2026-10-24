@@ -3,7 +3,7 @@
 Build in parallel with collaborating [Pi](https://pi.dev) agents and deliver their changes to your project.
 
 This package is installed as a Pi package. Its `bin/delm` runtime, the shared worker policy
-(`worker.md`) and the two extensions are staged by the repository's build script:
+(`worker.md`, staged from the repository's `plugin/worker.md`) and the two extensions are staged by the repository's build script:
 
 ```sh
 ./scripts/build.sh --host pi

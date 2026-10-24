@@ -7,7 +7,7 @@
 // waiting on worker 1 on every prompt. The scenario is selected by
 // DELM_PI_WORKER; the controller, sidecar and delivery are production code.
 import {spawn} from 'node:child_process';
-import {writeFileSync} from 'node:fs';
+import {appendFileSync, writeFileSync} from 'node:fs';
 import {connect} from 'node:net';
 import {createInterface} from 'node:readline';
 
@@ -111,6 +111,12 @@ async function run(prompt) {
       // Leave the run active long enough for peer 2's duplicate attempt to be judged.
       if (process.env.FAKE_PI_MARK) await new Promise(resolve => setTimeout(resolve, 4000));
       const check = await bash("printf 'hello from delm\\n' > hello.txt && cat hello.txt");
+      // Pi starts another model loop within the same run when it drains a steer; the turn must survive it.
+      emit({type: 'agent_start'});
+      emit({type: 'turn_start'});
+      let continued = 'continued_turn=ok';
+      try { await coordinate('delm_status', {}); } catch (error) { continued = 'continued_turn=' + error.message; }
+      if (process.env.FAKE_PI_MARK) appendFileSync(process.env.FAKE_PI_MARK, continued + '\n');
       await coordinate('delm_complete', {
         idempotency_key: 'complete-1-' + calls, expected_revision: 1, outcome: 'complete',
         summary: 'Created hello.txt with a greeting; verified by printing it.', checks: [check.callId], shared_checks: [], artifacts: [],

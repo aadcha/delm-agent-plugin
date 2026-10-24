@@ -147,6 +147,10 @@ def validate_pi_package(package):
     for name in PI_PACKAGE_FILES:
         if name.endswith(".ts"):
             subprocess.run(["node", "--experimental-strip-types", "--check", str(package / name)], check=True)
+    # The extensions call `delm pi serve|mcp|view|recover`; a runtime without the Pi host must not stage.
+    probe = subprocess.run([str(package / "bin" / "delm"), "pi", "view", "--help"], capture_output=True, text=True)
+    if probe.returncode != 0 or "--run-id" not in probe.stdout + probe.stderr:
+        raise RuntimeError("The staged runtime does not provide the Pi host commands: " + (probe.stderr or probe.stdout).strip()[:300])
     return {"kind": "pi-package-validation", "extensions": declared}
 
 

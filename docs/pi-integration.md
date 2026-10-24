@@ -22,7 +22,7 @@ the two workers, and the shared Rust controller owns the board, evidence and del
 
 ```mermaid
 flowchart LR
-  User["/delm run"] --> Ext[Parent Pi extension]
+  User["/delm:run"] --> Ext[Parent Pi extension]
   Ext -->|delm pi serve| Ctl[Rust controller]
   Ctl -->|ready: workspaces, socket, token| Ext
   Ext -->|fork session, spawn| W1[Worker 1: pi --mode rpc]
@@ -35,19 +35,19 @@ flowchart LR
 
 ### Invocation
 
-`/delm run <task>` is a Pi command registered by `hosts/pi/extensions/delm.ts`. It starts
+`/delm:run <task>` is a Pi command registered by `hosts/pi/extensions/delm.ts`. It starts
 `delm pi serve` with the project, the parent session id and the task, reads the ready contract
 (run id, control socket, token, runtime executable, two worker directories, revision), and keeps that
-process as the run's bridge. `/delm stop` cancels; `/delm status` reports.
+process as the run's bridge. `/delm:stop` cancels; `/delm:status` reopens the board.
 
 ### Workers
 
 For each worker the extension forks the parent session file into the worker's private directory
-(`SessionManager.forkFrom(parentFile, workerCwd)`), so both workers inherit the conversation up to
+(`SessionManager.forkFrom(parentFile, workerCwd, sessionDir)`), so both workers inherit the conversation up to
 the invocation, then spawns
 
 ```
-pi --mode rpc --session <forked file> --append-system-prompt <worker policy> \
+pi --mode rpc --session-dir <run's session dir> --session <forked file> --append-system-prompt <worker policy> \
    --extension <hosts/pi/extensions/delm-worker.ts> --model <parent model> --thinking <level>
 ```
 
@@ -105,11 +105,18 @@ project.
 
 ### Updates, completion, shutdown
 
-A follow-up `/delm run` while a run is active, or plain text sent while the run owns input, is
-forwarded with `update`; active workers receive it by `steer`, idle ones by `prompt`. A `candidate`
-action (a worker completed) starts finalization: the other worker is stopped, both processes exit,
-and `settle` delivers through the shared path. `/delm stop` or a parent exit cancels. Recovery after a
-parent restart reuses `delm pi recover` with the durable `pi.json` record.
+A follow-up `/delm:run <text>` while a run is active, or plain text sent while the run owns input, is
+forwarded with `update`; each worker receives it as a steer, which Pi queues for the next model call
+while the worker streams and starts a run with when it is idle. A `candidate` action (a worker
+completed) starts finalization: the other worker is stopped, both processes exit, and `settle`
+delivers through the shared path. `/delm:stop` or a parent exit cancels. If the runtime process itself
+exits mid-run, the session releases the run, keeps the private workspaces and points at `/delm:recover`.
+Recovery after a parent restart reuses `delm pi recover` with the durable run record (`claude.json`
+with `host: "pi"`).
+
+A worker's model error is kept for its turn's outcome; the run stops only when Pi reports it will not
+retry, and context-overflow errors are left to Pi's own compaction. Login and quota refusals stop the
+run at once with the explanation.
 
 ## What is not inherited
 
@@ -134,8 +141,8 @@ Exercised so far:
 
 - `hosts/pi/tests/live-lifecycle.mjs` drives the installed Pi 1.4.0 in RPC mode with a real model
   through three scenarios, all passing on 2026-10-22: a typed update mid-run reached both peers and its
-  extra function was delivered; `/delm:stop` left no worker process, no unfinished run and an unchanged
-  project; a killed session left no worker process, the next session reported the unfinished run, and
+  extra function was delivered; `/delm:stop` left no unfinished run and an unchanged project; a killed
+  session left the next session reporting the unfinished run, and
   `/delm:recover` saved its changes and released the project. It bills the provider login and is run
   explicitly, not by `npm test`.
 
@@ -146,7 +153,7 @@ Exercised so far:
 - the interactive TUI, driven through a pseudo-terminal on Pi 1.4.0 (2026-10-24): `/delm:run` on a
   four-part package request filled the queue within ten seconds, `/delm:board tasks` opened the overlay
   and Esc closed it, `/delm:board hide` and `/delm:status` hid and reopened the board, `/delm:stop` left
-  the project unchanged with no worker process, and a second run delivered nine files with the final
+  the project unchanged with no worker process (checked by pid), and a second run delivered nine files with the final
   board repainted at Complete and no Pi truncation notice.
 
 Not exercised yet: steering an actively streaming worker from the UI, a parent restart with recovery, forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.

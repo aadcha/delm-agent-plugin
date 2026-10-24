@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {readFileSync} from 'node:fs';
 import {commandOutcome, coordinationTool, decodeLines, duplicateTask, duplicateTaskReason, explainModelError, launchPrompt, toolArguments, turnReason, updateText, validateReady}
   from '../lib/protocol.ts';
 
@@ -77,9 +78,20 @@ test('a second task with an open title is detected regardless of case, spacing o
   ];
   assert.equal(duplicateTask('Calc ops.py, tests test_ops.py', tasks)?.id, 3);
   assert.equal(duplicateTask('readme', tasks), null, 'finished tasks never match');
+  const symbols = [{id: 9, title: 'C++ bindings', state: 'claimed', owner: 1}, {id: 10, title: 'Fix #12', state: 'available', owner: null}];
+  assert.equal(duplicateTask('C bindings', symbols), null, 'C and C++ are different work');
+  assert.equal(duplicateTask('c++  bindings', symbols)?.id, 9);
+  assert.equal(duplicateTask('Fix 12', symbols), null, 'an issue number is not plain text');
+  assert.equal(duplicateTask('fix: #12', symbols)?.id, 10);
   assert.equal(duplicateTask('calc/cli.py', tasks), null);
   assert.equal(duplicateTask('', tasks), null);
   const reason = duplicateTaskReason(tasks[0], slot => 'Agent ' + slot);
   assert.match(reason, /^A task with this title already exists: #1 "calc\/ops.py \+ tests\/test_ops.py" \(claimed by Agent 2, task_id 3\)/);
   assert.match(duplicateTaskReason({...tasks[0], state: 'available', owner: null}, () => 'x'), /\(available, task_id 3\)/);
+});
+
+test('the development copy of the worker policy matches the shared policy the build stages', () => {
+  const here = new URL('.', import.meta.url).pathname;
+  assert.equal(readFileSync(here + '../worker.md', 'utf8'), readFileSync(here + '../../../plugin/worker.md', 'utf8'),
+    'hosts/pi/worker.md drifted from plugin/worker.md; copy plugin/worker.md over it');
 });

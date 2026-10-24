@@ -94,9 +94,16 @@ export function launchPrompt(task: string, slot: number, planned = true): string
     + planning + '\n\nUser request:\n' + task;
 }
 
-/** Titles compared without case, punctuation or spacing, so "calc/ops.py + tests" and "Calc ops.py tests" collide. */
+/**
+ * Titles compared without case, spacing or separator punctuation, so "calc/ops.py + tests" and
+ * "Calc ops.py, tests" collide, while symbols that name different work ("C++" vs "C", "#12") survive.
+ */
 export function normalizeTitle(title: unknown): string {
-  return String(title ?? '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  return String(title ?? '').toLowerCase()
+    .replace(/[\s_/\\.,:;'"`()\[\]{}|<>!?-]+/gu, ' ')
+    .split(' ')
+    .filter(token => token && /[\p{L}\p{N}]/u.test(token))
+    .join(' ');
 }
 
 export type OpenTask = {id: number; task_number?: number; title: string; state: string; owner?: number | null};

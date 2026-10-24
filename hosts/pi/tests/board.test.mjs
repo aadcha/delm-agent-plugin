@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {agentState, phaseLabel, renderBoard, renderCollection, taskState} from '../lib/board.ts';
+import {agentState, fit, phaseLabel, renderBoard, renderCollection, taskState} from '../lib/board.ts';
 
 const view = {
   status: 'running', finished: false, revision: 2, freshness: {unavailable: []},
@@ -55,6 +55,17 @@ test('the board fits inside the ten lines Pi shows for a widget', () => {
   assert.equal(ended[2], '  Agent 2 · Stopped');
   assert.ok(ended.some(line => line.includes('Unfinished changes were saved for recovery.')));
   assert.ok(ended.some(line => line.startsWith('  #1 ')), 'at least one task row survives');
+});
+
+test('an outcome reason survives the height cap and wide characters are measured in cells', () => {
+  const empty = {...view, tasks: {items: [], total: 0}, status: 'delivered', finished: true,
+    outcome: {status: 'delivered', delivered: true, verification_required: true, conflicts_total: 2, changed_paths_count: 3, reason: 'Two edits conflicted'}};
+  const lines = renderBoard(empty, 80);
+  assert.ok(lines.length <= 10, String(lines.length));
+  assert.ok(lines.some(line => line.includes('Two edits conflicted')), lines.join('\n'));
+  assert.equal(fit('日本語テキスト', 7), '日本語…');
+  assert.equal(fit('👩‍👩‍👧‍👦abc', 4), '👩‍👩‍👧‍👦a…', 'a wide cluster costs two cells and is never split');
+  assert.equal(fit('plain', 10), 'plain');
 });
 
 test('agent and task states read like the Claude board', () => {

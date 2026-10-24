@@ -6,11 +6,17 @@ import type {ExtensionAPI} from '@earendil-works/pi-coding-agent';
 import {requestTicket} from '../lib/bridge.ts';
 import {MCP_SERVER_NAME, coordinationTool, toolArguments} from '../lib/protocol.ts';
 
+const LOADED = Symbol.for('delm.pi.worker');
+
 export default function (pi: ExtensionAPI) {
   const slot = process.env.DELM_PI_WORKER;
   const bridge = process.env.DELM_PI_BRIDGE;
   const runtime = process.env.DELM_PI_RUNTIME;
   if (!slot) return;
+  // A second copy (the installed package plus a `-e` path) must not register twice.
+  const globals = globalThis as unknown as Record<symbol, boolean>;
+  if (globals[LOADED]) return;
+  globals[LOADED] = true;
   if (!bridge || !runtime) {
     throw new Error('DeLM worker environment is incomplete: DELM_PI_BRIDGE and DELM_PI_RUNTIME are required.');
   }
@@ -20,8 +26,12 @@ export default function (pi: ExtensionAPI) {
   // a shortened id; an unambiguous prefix is completed before the call is
   // bound, so the runtime still matches it to the observed command.
   const bashCalls: string[] = [];
+  const otherCalls = new Set<string>();
+  const MIN_PREFIX = 8;
   const complete = (value: unknown): unknown => {
     if (typeof value !== 'string' || !value || bashCalls.includes(value)) return value;
+    // Short or sequential ids (call_1, call_10) must not be completed into a different call.
+    if (value.length < MIN_PREFIX || otherCalls.has(value)) return value;
     const matches = bashCalls.filter(id => id.startsWith(value));
     return matches.length === 1 ? matches[0] : value;
   };
@@ -44,7 +54,7 @@ export default function (pi: ExtensionAPI) {
   pi.on('tool_call', async event => {
     if (event.toolName === 'bash') { bashCalls.push(event.toolCallId); if (bashCalls.length > 256) bashCalls.shift(); return undefined; }
     const tool = coordinationTool(event.toolName);
-    if (!tool) return undefined;
+    if (!tool) { otherCalls.add(event.toolCallId); if (otherCalls.size > 1024) otherCalls.delete(otherCalls.values().next().value as string); return undefined; }
     const input = event.input as Record<string, unknown>;
     const arguments_ = toolArguments(input);
     completeCommandIds(tool, arguments_);

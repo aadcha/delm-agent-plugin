@@ -4,7 +4,7 @@
 // user's updates, and reports the delivered result.
 import type {ExtensionAPI, ExtensionContext} from '@earendil-works/pi-coding-agent';
 import {SessionManager} from '@earendil-works/pi-coding-agent';
-import {appendFileSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
+import {appendFileSync, mkdtempSync, readFileSync, realpathSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -22,9 +22,12 @@ type Worker = {
   slot: number;
   agentId: string;
   process: PiProcess;
+  /** The run this worker belongs to; late events after that run ended are ignored. */
+  run: Run;
+  /** Events are handled one at a time per worker, in arrival order. */
+  chain: Promise<void>;
   turn: string | null;
   deliveredRevision: number;
-  pendingUpdate: {revision: number; message: string} | null;
   status: 'running' | 'completed' | 'failed' | 'killed';
   stopPromise: Promise<unknown> | null;
   lastError: string | null;
@@ -44,6 +47,7 @@ type Run = {
   tickets: TicketServer[];
   /** Peer 2's launch waits for the first shared task; an update releases it early. */
   launchGate: {release: () => Promise<void>} | null;
+  bridgeExited: boolean;
   finalization: {generation: number; revision: number; intent: string} | null;
   settling: Promise<void> | null;
   finished: boolean;
@@ -65,8 +69,14 @@ function workerPolicy(): string {
   return policy.trimEnd() + '\n\n' + hostNotes() + '\n';
 }
 
+const LOADED = Symbol.for('delm.pi.parent');
+
 export default function (pi: ExtensionAPI) {
   if (process.env.DELM_PI_WORKER) return;   // A worker never starts a nested run.
+  // A second copy (the installed package plus a `-e` path) must not register the commands twice.
+  const globals = globalThis as unknown as Record<symbol, boolean>;
+  if (globals[LOADED]) return;
+  globals[LOADED] = true;
 
   let run: Run | null = null;
   let lastFinished: Run | null = null;
@@ -84,20 +94,21 @@ export default function (pi: ExtensionAPI) {
     return request(run.bridge.ready, op, fields, timeoutMs);
   }
 
-  function worker(agentId: unknown): Worker | undefined {
-    return run?.workers.find(w => w.agentId === agentId);
+  /** The same request bound to one run, for callbacks that may outlive it. */
+  function controlOn(current: Run, op: string, fields: Record<string, unknown> = {}, timeoutMs?: number) {
+    if (current.finished || run !== current) return Promise.reject(new Error('This DeLM run has ended.'));
+    return request(current.bridge.ready, op, fields, timeoutMs);
   }
 
   // ---- actions from the controller ------------------------------------------
 
-  async function applyActions(list: Action[]) {
-    const current = run;
-    if (!current) return;
+  async function applyActions(list: Action[], current: Run | null = run) {
+    if (!current || run !== current) return;
     for (const action of list) {
       if (current.finished && action.type !== 'final') return;
       if (action.id && current.lastAction === action.id) continue;
       try {
-        await applyAction(action);
+        await applyAction(current, action);
       } catch (error) {
         current.failure = String((error as Error).message || error);
         notify('DeLM: ' + current.failure, 'error');
@@ -107,44 +118,38 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function applyAction(action: Action) {
-    if (!run) return;
+  async function applyAction(current: Run, action: Action) {
+    if (run !== current) return;
     switch (action.type) {
       case 'candidate':
       case 'stop': {
         const finalization = action.finalization as Run['finalization'];
         if (!finalization) throw new Error('DeLM received an incompatible finalization contract.');
-        if (finalization.revision < run.revision) return;
-        run.finalization = finalization;
+        if (finalization.revision < current.revision) return;
+        current.finalization = finalization;
         status(finalization.intent === 'deliver' ? 'DeLM: delivering' : 'DeLM: stopping');
         void settle();
         return;
       }
-      case 'resume': {
-        const target = worker(action.agent_id);
-        if (!target || run.finalization) return;
-        if (Number.isSafeInteger(action.revision)) run.revision = Math.max(run.revision, action.revision as number);
-        await deliver(target, String(action.message), action.revision as number, true);
-        return;
-      }
+      case 'resume':
       case 'context': {
-        const target = worker(action.agent_id);
-        if (!target || run.finalization) return;
-        if (Number.isSafeInteger(action.revision)) run.revision = Math.max(run.revision, action.revision as number);
-        await deliver(target, String(action.message), action.revision as number, false);
+        const target = current.workers.find(w => w.agentId === action.agent_id);
+        if (!target || current.finalization) return;
+        if (Number.isSafeInteger(action.revision)) current.revision = Math.max(current.revision, action.revision as number);
+        await deliver(target, String(action.message), action.revision as number, action.type === 'resume');
         return;
       }
       case 'completion_intent':
         return;
       case 'final': {
-        run.finished = true;
-        run.final = action;
+        current.finished = true;
+        current.final = action;
         status(undefined);
         const outcome = String(action.status);
         const delivered = outcome === 'complete' || outcome === 'delivered';
         if (delivered) notify('DeLM delivered the result into your project.');
-        else if (run.modelErrorReported) notify('DeLM stopped without changing your project. Fix the model access above, then run /delm:run again.', 'warning');
-        else notify('DeLM ' + outcome.replaceAll('_', ' ') + (run.failure ? ': ' + run.failure : '') + '. Worker log: ' + join(run.sessionDir, 'delm-pi.log'), 'warning');
+        else if (current.modelErrorReported) notify('DeLM stopped without changing your project. Fix the model access above, then run /delm:run again.', 'warning');
+        else notify('DeLM ' + outcome.replaceAll('_', ' ') + (current.failure ? ': ' + current.failure : '') + '. Worker log: ' + join(current.sessionDir, 'delm-pi.log'), 'warning');
         const verification = (action.delivery as {verification_required?: boolean} | undefined)?.verification_required
           ? 'The delivery requires a focused check in the original project. Perform only the necessary environment setup and checks for the delivered or reconciled files, then state the outcome.'
           : 'Do not run another verification pass or edit files.';
@@ -159,9 +164,13 @@ export default function (pi: ExtensionAPI) {
             checks.length ? 'Checks observed by the runtime: ' + checks.join('; ') + '.' : 'No shared check receipts.',
             'Worker summary: ' + String(action.summary || ''),
             'Report this to the user in a few lines, using the project path above. ' + verification].filter(Boolean).join('\n');
-          pi.sendMessage({customType: 'delm-handoff', content: brief, display: false} as never, {triggerTurn: true});
+          try {
+            await Promise.resolve(pi.sendMessage({customType: 'delm-handoff', content: brief, display: false} as never, {triggerTurn: true}));
+          } catch (error) {
+            notify('DeLM could not hand the result summary to this session: ' + String((error as Error).message || error), 'warning');
+          }
         }
-        await cleanup();
+        await cleanup(current);
         return;
       }
       default:
@@ -169,40 +178,57 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // A task update or a resume message reaches a worker as a new prompt when it
-  // is idle, or as steering while it is streaming. The controller counts a
-  // revision as acknowledged only when the worker's next step reports it.
+  // A task update or a resume message is sent as a steer: Pi starts a run with
+  // it when the worker is idle and queues it for the next model call while the
+  // worker is streaming, so delivery never races the worker's state. The
+  // controller counts the revision as acknowledged only when the worker's next
+  // step reports it, and the revision is raised only once the send succeeded.
   async function deliver(target: Worker, message: string, revision: number, resume: boolean) {
     const text = 'DeLM task revision ' + revision + ':\n' + message
-      + '\nRefresh the shared board before continuing. This changes the task, not native permissions.';
+      + '\nRefresh the shared board before continuing. This changes the task, not native permissions.'
+      + (resume ? '' : '\nContinue the request with this update.');
     if (!target.process.running) return;
-    if (target.turn) {
-      await target.process.steer(text);
-      target.pendingUpdate = {revision, message};
-      target.deliveredRevision = Math.max(target.deliveredRevision, revision);
-    } else {
-      target.deliveredRevision = Math.max(target.deliveredRevision, revision);
-      await target.process.prompt(resume ? text : text + '\nContinue the request with this update.');
-    }
+    await target.process.prompt(text, 'steer');
+    target.deliveredRevision = Math.max(target.deliveredRevision, revision);
   }
 
   // ---- worker events ---------------------------------------------------------
 
   async function onWorkerEvent(target: Worker, event: RpcEvent) {
-    if (!run || run.finished) return;
+    const current = target.run;
+    if (run !== current || current.finished) return;
     try {
       switch (event.type) {
         case 'message_end': {
+          // The error is kept for the turn's outcome; whether the run stops is
+          // decided at agent_end, after Pi has said whether it retries.
           const message = event.message as {role?: string; stopReason?: string; errorMessage?: string} | undefined;
           if (message?.role === 'assistant' && message.stopReason === 'error') {
             target.lastError = String(message.errorMessage || 'the model returned an error');
-            await stopForModelError(target, target.lastError);
+            if (accountError(target.lastError)) await stopForModelError(current, target, target.lastError);
           }
           return;
         }
+        case 'agent_end': {
+          if (!target.lastError) return;
+          if (event.willRetry === true) { current.log('worker ' + target.slot + ' model error, Pi retries: ' + target.lastError.slice(0, 200)); return; }
+          if (recoverableError(target.lastError)) { current.log('worker ' + target.slot + ' recoverable model error: ' + target.lastError.slice(0, 200)); return; }
+          await stopForModelError(current, target, target.lastError);
+          return;
+        }
+        case 'extension_ui_request': {
+          // A worker's own extensions may open a dialog; nobody can answer it there.
+          target.process.cancelUiRequest(event.id);
+          current.log('worker ' + target.slot + ' cancelled a UI request from its extensions');
+          return;
+        }
         case 'agent_start': {
+          // Pi starts a new model loop within one run when it drains a steer or
+          // recovers from context overflow; the native turn spans the whole run,
+          // from the first agent_start to agent_settled.
+          if (target.turn) return;
           target.turn = randomUUID();
-          await control('step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
+          await controlOn(current, 'step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
           return;
         }
         case 'turn_start': {
@@ -210,21 +236,21 @@ export default function (pi: ExtensionAPI) {
           // was steered into the run, the next call has it in context, so this
           // is where the worker acknowledges the new revision (as Claude does
           // on turn.step). A stale worker is skipped until its update lands.
-          if (!target.turn || target.deliveredRevision !== run.revision) return;
-          await control('step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
+          if (!target.turn || target.deliveredRevision !== current.revision) return;
+          await controlOn(current, 'step', {agent_id: target.agentId, turn_id: target.turn, revision: target.deliveredRevision});
           return;
         }
         case 'tool_execution_start': {
           if (event.toolName !== 'bash' || !target.turn) return;
           const args = (event.args || {}) as {command?: string};
           try {
-            await control('command_start', {
+            await controlOn(current, 'command_start', {
               agent_id: target.agentId, turn_id: target.turn, call_id: String(event.toolCallId),
-              command: String(args.command ?? ''), cwd: run.bridge.ready.workers[target.slot - 1].cwd,
+              command: String(args.command ?? ''), cwd: current.bridge.ready.workers[target.slot - 1].cwd,
             });
           } catch (error) {
             // Unrecorded evidence only means this command cannot back a check receipt.
-            run.log('worker ' + target.slot + ' command_start refused: ' + String((error as Error).message || error));
+            current.log('worker ' + target.slot + ' command_start refused: ' + String((error as Error).message || error));
           }
           return;
         }
@@ -232,13 +258,13 @@ export default function (pi: ExtensionAPI) {
           if (event.toolName !== 'bash' || !target.turn) return;
           const outcome = commandOutcome(event as {result?: unknown; isError?: boolean});
           try {
-            await control('command_end', {
+            await controlOn(current, 'command_end', {
               agent_id: target.agentId, call_id: String(event.toolCallId), result_ref: String(event.toolCallId),
               exit_code: outcome.exit_code, is_error: outcome.is_error, interrupted: outcome.interrupted,
               timed_out: outcome.timed_out, background_task_id: null,
             });
           } catch (error) {
-            run.log('worker ' + target.slot + ' command_end refused: ' + String((error as Error).message || error));
+            current.log('worker ' + target.slot + ' command_end refused: ' + String((error as Error).message || error));
           }
           return;
         }
@@ -249,54 +275,83 @@ export default function (pi: ExtensionAPI) {
           const answer = (await target.process.lastAssistantText().catch(() => null)) || '';
           const reason = target.lastError && !answer ? 'failed' : turnReason(event as {aborted?: boolean}, !target.process.running);
           target.lastError = null;
-          const result = await control('turn_end', {agent_id: target.agentId, turn_id: turn, reason, answer});
-          await applyActions((result.actions as Action[]) || []);
-          if (target.pendingUpdate && reason === 'completed' && !run.finalization && target.process.running) {
-            const pending = target.pendingUpdate;
-            target.pendingUpdate = null;
-            await deliver(target, pending.message, pending.revision, true);
-          }
+          const result = await controlOn(current, 'turn_end', {agent_id: target.agentId, turn_id: turn, reason, answer});
+          await applyActions((result.actions as Action[]) || [], current);
           return;
         }
         default:
           return;
       }
     } catch (error) {
-      if (!run.finalization) {
-        run.failure = String((error as Error).message || error);
-        notify('DeLM: ' + run.failure, 'error');
+      if (run === current && !current.finalization && !current.finished) {
+        current.failure = String((error as Error).message || error);
+        notify('DeLM: ' + current.failure, 'error');
       }
     }
+  }
+
+  /** Login and quota refusals are about the account; stop at once, before Pi retries them. */
+  function accountError(raw: string): boolean {
+    return /out of extra usage|\b401\b|authentication|invalid[ -_]?(x-)?api[ -_]?key|unauthorized|token expired|not logged in|model not found|does not exist|unsupported model|\b404\b/i.test(raw);
+  }
+
+  /** Context overflow is recovered by Pi's own compaction; the run goes on. */
+  function recoverableError(raw: string): boolean {
+    return /context|too long|too many tokens|token limit|prompt is too large|maximum.*length/i.test(raw);
   }
 
   // The workers use the same provider login as this session, so a refusal is
   // almost always about the account, not the task. Stop before the controller
   // spends resumes on empty turns, and tell the user what to change.
-  async function stopForModelError(target: Worker, error: string) {
-    if (!run || run.finished || run.finalization || run.modelErrorReported) return;
-    run.modelErrorReported = true;
-    run.failure = explainModelError(error);
-    notify('DeLM stopped: peer ' + target.slot + '\'s model request was rejected. ' + run.failure
+  async function stopForModelError(current: Run, target: Worker, error: string) {
+    if (run !== current || current.finished || current.finalization || current.modelErrorReported) return;
+    current.modelErrorReported = true;
+    current.failure = explainModelError(error);
+    notify('DeLM stopped: peer ' + target.slot + '\'s model request was rejected. ' + current.failure
       + ' Nothing in your project was changed.', 'error');
     try {
-      const cancelled = await control('cancel', {reason: 'Peer model error'});
-      await applyActions((cancelled.actions as Action[]) || []);
+      const cancelled = await controlOn(current, 'cancel', {reason: 'Peer model error'});
+      await applyActions((cancelled.actions as Action[]) || [], current);
     } catch (cancelError) {
-      notify('DeLM could not stop cleanly: ' + String((cancelError as Error).message || cancelError), 'error');
+      if (current.bridgeExited) await abandon(current, 'the DeLM runtime exited');
+      else notify('DeLM could not stop cleanly: ' + String((cancelError as Error).message || cancelError), 'error');
     }
   }
 
   async function onWorkerExit(target: Worker) {
-    if (!run || run.finished) return;
-    if (target.status === 'running') target.status = run.finalization ? 'killed' : 'failed';
+    const current = target.run;
+    if (run !== current || current.finished) return;
+    if (target.status === 'running') target.status = current.finalization ? 'killed' : 'failed';
     if (target.turn) {
       const turn = target.turn;
       target.turn = null;
       try {
-        const result = await control('turn_end', {agent_id: target.agentId, turn_id: turn, reason: 'failed', answer: ''});
-        await applyActions((result.actions as Action[]) || []);
+        const result = await controlOn(current, 'turn_end', {agent_id: target.agentId, turn_id: turn, reason: 'failed', answer: ''});
+        await applyActions((result.actions as Action[]) || [], current);
       } catch { /* The controller retires the turn at settlement. */ }
+    } else if (!current.finalization && !current.stopRequested) {
+      // An idle worker that disappears is not seen by the controller until it is resumed.
+      current.log('worker ' + target.slot + ' exited while idle: ' + (target.process.stderr.trim().slice(-300) || 'no stderr'));
+      notify('DeLM: peer ' + target.slot + ' exited unexpectedly. See the worker log: ' + join(current.sessionDir, 'delm-pi.log'), 'warning');
     }
+    if (run === current && !current.finished && !current.finalization && current.workers.every(w => !w.process.running)) {
+      current.failure = 'Both peers exited';
+      try {
+        const cancelled = await controlOn(current, 'cancel', {reason: 'Both native peers exited'});
+        await applyActions((cancelled.actions as Action[]) || [], current);
+      } catch { if (current.bridgeExited) await abandon(current, 'both peers and the DeLM runtime exited'); }
+    }
+  }
+
+  /** The runtime is gone, so no delivery or cancel can reach it: release the session, keep the workspaces for /delm:recover. */
+  async function abandon(current: Run, reason: string) {
+    if (run !== current || current.finished) return;
+    current.finished = true;
+    current.failure = current.failure || reason;
+    await stopWorkers(current);
+    notify('DeLM run interrupted: ' + reason + '. Its private workspaces are kept; run /delm:recover to save the unfinished changes. Worker log: '
+      + join(current.sessionDir, 'delm-pi.log'), 'error');
+    await cleanup(current);
   }
 
   // ---- launch ----------------------------------------------------------------
@@ -305,11 +360,11 @@ export default function (pi: ExtensionAPI) {
   // inherit. It cannot see usage quotas; those surface on the first request.
   function checkLogin(model: {provider: string; id: string} | null): Promise<void> {
     if (!model) return Promise.reject(new Error('No model is selected in this Pi session. Choose one with /model, then run /delm:run again.'));
+    if (process.env.DELM_PI_COMMAND) return Promise.resolve();   // a scripted host has no login
     return new Promise((resolve, reject) => {
       execFile(process.env.DELM_PI_COMMAND || 'pi', ['auth', 'check', '--provider', model.provider, '--model', model.id, '--json'],
         {timeout: 30000, env: process.env}, (error, stdout, stderr) => {
           if (!error) return resolve();
-          if (process.env.DELM_PI_COMMAND) return resolve();   // a scripted host has no login
           const detail = String(stdout || stderr || error.message).trim().replace(/\s+/g, ' ').slice(0, 300);
           reject(new Error('Pi has no working login for ' + model.provider + '/' + model.id + ' (' + detail + '). Run /login in Pi, then /delm:run again.'));
         });
@@ -326,18 +381,30 @@ export default function (pi: ExtensionAPI) {
     const bridge = await startBridge(executable, {
       project: ctx.cwd, session_id: sessionId, task, host_version: null, package_root: PACKAGE_ROOT,
     }, actions => { void applyActions(actions); });
-    if (bridge.ready.session_id !== sessionId) throw new Error('DeLM returned workspaces for another conversation.');
+    if (bridge.ready.session_id !== sessionId) {
+      try { await request(bridge.ready, 'cancel', {reason: 'Session mismatch at launch'}, 5000); } catch { bridge.process.kill('SIGTERM'); }
+      throw new Error('DeLM returned workspaces for another conversation.');
+    }
     const sessionDir = mkdtempSync(join(tmpdir(), 'delm-pi-sessions-'));
     const logFile = join(sessionDir, 'delm-pi.log');
     const log = (line: string) => { try { appendFileSync(logFile, new Date().toISOString() + ' ' + line + '\n'); } catch { /* Diagnostics only. */ } };
     run = {
       sessionId, task, bridge, revision: bridge.ready.revision, workers: [], tickets: [], finalization: null,
       settling: null, finished: false, final: null, lastAction: null, failure: null, stopRequested: false, sessionDir, log,
-      modelErrorReported: false, observer: null, view: null, boardHidden: false, launchGate: null,
+      modelErrorReported: false, observer: null, view: null, boardHidden: false, launchGate: null, bridgeExited: false,
     };
+    const current = run;
     startBoard(ctx);
     log('run ' + bridge.ready.run_id + ' project ' + ctx.cwd + ' sessions ' + sessionDir);
-    void bridge.exited.then(() => { if (run && !run.finished) { run.failure = 'DeLM runtime exited.'; status('DeLM: runtime exited'); } });
+    void bridge.exited.then(async code => {
+      current.bridgeExited = true;
+      if (run !== current || current.finished) return;
+      // The runtime announces a normal end with a final action before exiting; give that a moment to arrive.
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      if (run !== current || current.finished) return;
+      current.log('runtime exited with code ' + code + ' before the run ended: ' + current.bridge.stderr().trim().slice(-500));
+      await abandon(current, 'the DeLM runtime exited (code ' + code + ')');
+    });
     const policyFile = join(sessionDir, 'worker-policy.md');
     writeFileSync(policyFile, workerPolicy(), {mode: 0o600});
     const model = selected ? `${selected.provider}/${selected.id}` : null;
@@ -367,31 +434,35 @@ export default function (pi: ExtensionAPI) {
             DELM_PI_RUN: bridge.ready.run_id},
         });
         const target: Worker = {
-          slot, agentId: 'pi-' + slot + '-' + child.pid, process: child, turn: null,
-          deliveredRevision: bridge.ready.revision, pendingUpdate: null, status: 'running', stopPromise: null, lastError: null,
+          slot, agentId: 'pi-' + slot + '-' + (child.pid || randomUUID().slice(0, 8)), process: child, run: current, chain: Promise.resolve(),
+          turn: null, deliveredRevision: bridge.ready.revision, status: 'running', stopPromise: null, lastError: null,
         };
-        run.workers.push(target);
+        current.workers.push(target);
         let deltas = 0;
         child.onEvent(event => {
           if (event.type === 'message_update') {
             // A heartbeat every 200 stream deltas shows a long response is still flowing.
-            if (++deltas % 200 === 0) run?.log('worker ' + slot + ' streaming: ' + deltas + ' deltas');
+            if (++deltas % 200 === 0) current.log('worker ' + slot + ' streaming: ' + deltas + ' deltas');
           } else if (event.type !== 'tool_execution_update') {
-            run?.log('worker ' + slot + ' ' + JSON.stringify(event).slice(0, 2000));
+            current.log('worker ' + slot + ' ' + JSON.stringify(event).slice(0, 2000));
           }
-          void onWorkerEvent(target, event);
+          // One event at a time per worker keeps command_start before command_end and both before turn_end.
+          target.chain = target.chain.then(() => onWorkerEvent(target, event)).catch(() => undefined);
         });
-        run.log('worker ' + slot + ' pid ' + child.pid + ' args ' + JSON.stringify(args));
-        void child.exited.then(() => onWorkerExit(target));
+        current.log('worker ' + slot + ' pid ' + child.pid + ' args ' + JSON.stringify(args));
+        void child.exited.then(() => { target.chain = target.chain.then(() => onWorkerExit(target)).catch(() => undefined); });
         await control('bind', {slot, agent_id: target.agentId});
         await control('configure_scopes', {agent_id: target.agentId, scopes: [{path: cwd, access: 'write'}]});
       }
-      const [first, second] = run.workers;
+      const [first, second] = current.workers;
       await first.process.prompt(launchPrompt(task, 1));
-      gateSecondPeer(run, second, task);
+      gateSecondPeer(current, second, task);
     } catch (error) {
-      try { await control('cancel', {reason: 'Native peer launch failed'}); } catch { /* Recovery retains the workspace. */ }
-      await cleanup();
+      try { await controlOn(current, 'cancel', {reason: 'Native peer launch failed'}); } catch { /* Recovery retains the workspace. */ }
+      // Whatever the cancel achieved, this session must not stay attached to a run that never started.
+      current.finished = true;
+      await stopWorkers(current);
+      await cleanup(current);
       throw error;
     }
     status('DeLM: 2 peers working');
@@ -437,15 +508,19 @@ export default function (pi: ExtensionAPI) {
     const deadline = Date.now() + LAUNCH_GATE_MS;
     let open = true;
     void released.then(() => { open = false; });
-    while (open && Date.now() < deadline && run === current && !current.finished) {
+    const shared = async () => {
       if ((current.view?.tasks.total ?? 0) > 0) return true;
       try {
         const page = await fetchCollection(runtimeExecutable(), current.bridge.ready.run_id, current.sessionId, 'tasks', 1);
-        if (page.tasks.total > 0) return true;
-      } catch (error) { current.log('launch gate check skipped: ' + String((error as Error).message || error)); }
+        return page.tasks.total > 0;
+      } catch (error) { current.log('launch gate check skipped: ' + String((error as Error).message || error)); return false; }
+    };
+    while (open && Date.now() < deadline && run === current && !current.finished) {
+      if (await shared()) return true;
       await Promise.race([released, new Promise(resolve => setTimeout(resolve, 1000))]);
     }
-    return false;
+    // Released early or timed out: the board may have filled meanwhile.
+    return run === current && !current.finished ? shared() : false;
   }
 
   /** Peers plan at the same moment; a second task with an existing open title is refused with the original named. */
@@ -462,12 +537,17 @@ export default function (pi: ExtensionAPI) {
 
   // ---- the live board ----------------------------------------------------------
 
-  const BOARD_WIDTH = 100;
+  // Pi wraps widget lines at the terminal width, so a line wider than the
+  // terminal costs a second row; the board sizes itself to what is there.
+  function boardWidth(): number {
+    const columns = Number(process.stdout.columns) || 100;
+    return Math.max(40, Math.min(100, columns - 2));
+  }
 
   function paintBoard(target: Run | null = run || lastFinished) {
     if (!target || !ctxRef?.hasUI) return;
     if (target.boardHidden || !target.view) { try { ctxRef.ui.setWidget('delm-board', undefined); } catch { /* no UI */ } return; }
-    try { ctxRef.ui.setWidget('delm-board', renderBoard(target.view, BOARD_WIDTH)); } catch { /* no UI */ }
+    try { ctxRef.ui.setWidget('delm-board', renderBoard(target.view, boardWidth())); } catch { /* no UI */ }
   }
 
   function startBoard(ctx: ExtensionContext) {
@@ -493,7 +573,12 @@ export default function (pi: ExtensionAPI) {
     let view: View;
     try { view = await fetchCollection(runtimeExecutable(), run.bridge.ready.run_id, run.sessionId, kind); }
     catch (error) { ctx.ui.notify('DeLM board detail unavailable: ' + String((error as Error).message || error), 'warning'); return; }
-    const lines = renderCollection(view, kind, BOARD_WIDTH);
+    const lines = renderCollection(view, kind, boardWidth());
+    if (ctx.mode !== 'tui') {
+      // Without the interactive UI the detail arrives as text.
+      ctx.ui.notify(lines.filter(line => line && !/^Esc or q/.test(line)).slice(0, 40).join('\n'), 'info');
+      return;
+    }
     await ctx.ui.custom<void>((tui, _theme, _keys, done) => {
       let offset = 0;
       const component = {
@@ -517,9 +602,9 @@ export default function (pi: ExtensionAPI) {
 
   // ---- shutdown and settlement -------------------------------------------------
 
-  async function stopWorkers(): Promise<{id: string; status: string}[]> {
-    if (!run) return [];
-    await Promise.all(run.workers.map(async target => {
+  async function stopWorkers(current: Run | null = run): Promise<{id: string; status: string}[]> {
+    if (!current) return [];
+    await Promise.all(current.workers.map(async target => {
       if (target.stopPromise) return target.stopPromise;
       target.stopPromise = (async () => {
         if (target.process.running) {
@@ -532,7 +617,7 @@ export default function (pi: ExtensionAPI) {
       })();
       return target.stopPromise;
     }));
-    return run.workers.map(target => ({id: target.agentId, status: target.status}));
+    return current.workers.map(target => ({id: target.agentId, status: target.status}));
   }
 
   async function settle() {
@@ -542,20 +627,21 @@ export default function (pi: ExtensionAPI) {
     const fence = {...current.finalization};
     current.settling = (async () => {
       try {
-        const begun = await control('begin_settle', {generation: fence.generation, revision: fence.revision});
+        const begun = await controlOn(current, 'begin_settle', {generation: fence.generation, revision: fence.revision});
         if (current.stopRequested && (begun.finalization as {intent?: string})?.intent !== 'cancel') {
-          const cancelled = await control('cancel', {reason: 'User requested /delm-stop'});
-          await applyActions((cancelled.actions as Action[]) || []);
+          const cancelled = await controlOn(current, 'cancel', {reason: 'User requested /delm-stop'});
+          await applyActions((cancelled.actions as Action[]) || [], current);
           return;
         }
-        const agents = await stopWorkers();
-        const final = await control('settle', {
+        const agents = await stopWorkers(current);
+        const final = await controlOn(current, 'settle', {
           generation: fence.generation, revision: fence.revision, agents, background_tasks_stopped: true,
         });
-        await applyActions((final.actions as Action[]) || []);
+        await applyActions((final.actions as Action[]) || [], current);
       } catch (error) {
+        if (current.bridgeExited && !current.finished) { current.failure = String((error as Error).message || error); await abandon(current, 'the DeLM runtime exited during delivery'); return; }
         if (!current.finished) {
-          try { await control('settlement_failed', {generation: fence.generation, revision: fence.revision}); } catch { /* Recovery. */ }
+          try { await controlOn(current, 'settlement_failed', {generation: fence.generation, revision: fence.revision}); } catch { /* Recovery. */ }
         }
         current.failure = String((error as Error).message || error);
         notify('DeLM: ' + current.failure + (current.finished ? '' : ' Private workspaces are preserved for recovery.'), 'error');
@@ -564,13 +650,13 @@ export default function (pi: ExtensionAPI) {
     try { await current.settling; } finally { current.settling = null; }
   }
 
-  async function cleanup() {
-    if (!run) return;
+  async function cleanup(current: Run | null = run) {
+    if (!current || run !== current) return;
     // The board observer exits by itself once the run record is finished.
-    for (const tickets of run.tickets) { try { await tickets.close(); } catch { /* Already closed. */ } }
-    for (const target of run.workers) { if (target.process.running) void target.process.stop(1000); }
+    for (const tickets of current.tickets) { try { await tickets.close(); } catch { /* Already closed. */ } }
+    for (const target of current.workers) { if (target.process.running) void target.process.stop(1000).catch(() => undefined); }
     status(undefined);
-    if (run.finished) { lastFinished = run; run = null; }
+    if (current.finished) { lastFinished = current; run = null; }
   }
 
   // ---- commands and input ----------------------------------------------------
@@ -582,7 +668,9 @@ export default function (pi: ExtensionAPI) {
       const task = (args || '').trim();
       if (run && !run.finished) {
         if (!task) { ctx.ui.notify('A DeLM run is already active. Send text to update it, or /delm:stop.', 'warning'); return; }
-        await forward(task);
+        if (run.finalization) { ctx.ui.notify('DeLM is finishing this run; the update was not sent. Start a new run once it ends.', 'warning'); return; }
+        try { await forward(task); ctx.ui.notify('DeLM forwarded your update to the peers.', 'info'); }
+        catch (error) { ctx.ui.notify('DeLM could not forward this update: ' + String((error as Error).message || error), 'error'); }
         return;
       }
       if (!task) { ctx.ui.notify('Enter a task after /delm:run.', 'warning'); return; }
@@ -600,11 +688,13 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       ctxRef = ctx;
       if (!run || run.finished) { ctx.ui.notify('No DeLM run is active.', 'info'); return; }
-      run.stopRequested = true;
+      const current = run;
+      current.stopRequested = true;
       try {
-        const cancelled = await control('cancel', {reason: 'User requested /delm-stop'});
-        await applyActions((cancelled.actions as Action[]) || []);
+        const cancelled = await controlOn(current, 'cancel', {reason: 'User requested /delm-stop'});
+        await applyActions((cancelled.actions as Action[]) || [], current);
       } catch (error) {
+        if (current.bridgeExited || /no longer reachable/.test(String((error as Error).message))) { await abandon(current, 'the DeLM runtime is not reachable'); return; }
         ctx.ui.notify('DeLM could not stop cleanly: ' + String((error as Error).message || error), 'error');
       }
     },
@@ -623,7 +713,7 @@ export default function (pi: ExtensionAPI) {
           + (target.failure ? '. ' + target.failure : ''), 'info');
         return;
       }
-      if (target.view) ctx.ui.setWidget('delm-board', renderBoard(target.view, BOARD_WIDTH));
+      if (target.view) ctx.ui.setWidget('delm-board', renderBoard(target.view, boardWidth()));
       else ctx.ui.notify('DeLM board is loading.', 'info');
     },
   });
@@ -638,7 +728,7 @@ export default function (pi: ExtensionAPI) {
       if (word === 'hide') { target.boardHidden = true; try { ctx.ui.setWidget('delm-board', undefined); } catch { /* no UI */ } return; }
       if (word === 'tasks' || word === 'shared' || word === 'checks') { await showCollection(ctx, word); return; }
       target.boardHidden = false;
-      if (target.view) ctx.ui.setWidget('delm-board', renderBoard(target.view, BOARD_WIDTH));
+      if (target.view) ctx.ui.setWidget('delm-board', renderBoard(target.view, boardWidth()));
       else ctx.ui.notify('DeLM board is loading.', 'info');
     },
   });
@@ -646,14 +736,20 @@ export default function (pi: ExtensionAPI) {
   // Recovery of a run whose session ended before it finished: the bridge is
   // gone, so the controller's tokenless path confirms the host exited and
   // saves the unfinished changes, releasing the project for a new run.
+  function canonical(path: string): string {
+    try { return realpathSync(path); } catch { return resolve(path); }
+  }
+
   function unfinishedRuns(project: string): {id: string; status: string}[] {
     const root = join(homedir(), 'Library', 'Application Support', 'DeLM', 'runs');
     if (!existsSync(root)) return [];
+    // The controller records the canonical project path; the session's cwd may be a symlink to it.
+    const wanted = new Set([project, resolve(project), canonical(project)]);
     const found: {id: string; status: string}[] = [];
     for (const id of readdirSync(root)) {
       try {
         const saved = JSON.parse(readFileSync(join(root, id, 'claude.json'), 'utf8')) as {host?: string; project?: string; finished?: boolean; status?: string};
-        if (saved.host === 'pi' && !saved.finished && saved.project && [project, resolve(project)].includes(saved.project)) {
+        if (saved.host === 'pi' && !saved.finished && saved.project && (wanted.has(saved.project) || wanted.has(canonical(saved.project)))) {
           found.push({id, status: String(saved.status)});
         }
       } catch { /* not a run record */ }
@@ -680,6 +776,7 @@ export default function (pi: ExtensionAPI) {
             }
             done();
           });
+          child.stdin?.on('error', () => { /* The exit callback reports the outcome. */ });
           child.stdin?.end('{}\n');
         });
       }
@@ -714,7 +811,7 @@ export default function (pi: ExtensionAPI) {
     if (event.text.startsWith('/')) return {action: 'continue'};
     try {
       await forward(event.text);
-      notify('DeLM forwarded your update to both peers.');
+      notify('DeLM forwarded your update to the peers.');
     } catch (error) {
       notify('DeLM could not forward this update: ' + String((error as Error).message || error), 'error');
     }
@@ -725,8 +822,11 @@ export default function (pi: ExtensionAPI) {
     if (lastFinished) stopBoard(lastFinished);
     if (run) stopBoard(run);
     if (!run || run.finished) return;
-    try { await control('interrupt', {reason: 'Conversation ended'}, 2000); } catch { /* Recovery keeps the work. */ }
-    await stopWorkers();
-    await cleanup();
+    const current = run;
+    try { await controlOn(current, 'interrupt', {reason: 'Conversation ended'}, 2000); } catch { /* Recovery keeps the work. */ }
+    // Pi waits for this handler without a bound; a stuck worker gets a short grace, then SIGKILL.
+    await Promise.race([stopWorkers(current), new Promise(resolve => setTimeout(resolve, 6000))]);
+    for (const target of current.workers) { if (target.process.running) { try { target.process.child.kill('SIGKILL'); } catch { /* gone */ } } }
+    await cleanup(current);
   });
 }

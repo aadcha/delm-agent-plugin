@@ -62,6 +62,7 @@ export function startBridge(executable: string, start: {project: string; session
     child.stderr!.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-8192); });
     const exited = new Promise<number | null>(settle => child.once('exit', code => settle(code)));
     child.once('error', error => reject(error));
+    child.stdin!.on('error', error => reject(new Error('DeLM runtime closed its input: ' + error.message + (stderr.trim() ? ' (' + stderr.trim() + ')' : ''))));
     child.stdout!.on('data', chunk => {
       let decoded: {rest: string; events: Record<string, unknown>[]};
       try { decoded = decodeLines(buffer, String(chunk)); } catch (error) { reject(error as Error); return; }
