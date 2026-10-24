@@ -150,6 +150,12 @@ Exercised so far:
   only after peer 1's task exists and its same-title task is refused) and in one real run on 2026-10-24
   whose queue held no duplicate titles; broader overlap between differently worded tasks remains model
   judgment.
+- after the two audit rounds, the live set again on 2026-10-24 with `anthropic/claude-haiku-5-5` workers
+  (`live-lifecycle.mjs update|stop|recover --model …`): the typed update reached both peers and its
+  function was delivered with no error notices; `/delm:stop` and the killed-session recovery passed with
+  no worker process left (checked by pid); and a TUI run of a four-part package request delivered nine
+  files with 16 passing tests in about 40 seconds, three distinct tasks on the queue and no duplicate,
+  at roughly 0.9M tokens, most of them cache reads.
 - the interactive TUI, driven through a pseudo-terminal on Pi 1.4.0 (2026-10-24): `/delm:run` on a
   four-part package request filled the queue within ten seconds, `/delm:board tasks` opened the overlay
   and Esc closed it, `/delm:board hide` and `/delm:status` hid and reopened the board, `/delm:stop` left
