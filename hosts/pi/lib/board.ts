@@ -39,12 +39,21 @@ export function phaseLabel(view: View): string {
   return PHASES[view.status] || 'Status unavailable';
 }
 
-export function agentState(agent: View['agents'][number]): string {
+export function agentState(agent: View['agents'][number], view?: Pick<View, 'agents' | 'finished'>): string {
   const native: Record<string, string> = {starting: 'Starting', ready: 'Ready', working: 'Working', waiting: 'Waiting for a peer',
     blocked: 'Needs attention', stopped: 'Stopped'};
+  // A stopped agent's last self-report no longer describes it.
+  if (agent.native_state === 'stopped' || view?.finished) return 'Stopped';
   if (agent.reported_state === 'blocked') return 'Needs attention';
-  if (agent.reported_state === 'waiting' && agent.dependency) return 'Waiting on ' + agent.dependency;
+  if (agent.reported_state === 'waiting' && agent.dependency) return 'Waiting on ' + dependencyLabel(agent.dependency, view);
   return native[agent.native_state] || (agent.task_ids?.length ? 'Claimed' : 'Status unavailable');
+}
+
+/** `worker:2` names a peer; other dependencies name a contribution and are shown as written. */
+function dependencyLabel(dependency: string, view?: Pick<View, 'agents'>): string {
+  const peer = /^worker:(\d+)$/.exec(dependency);
+  if (!peer) return dependency;
+  return view?.agents.find(agent => String(agent.slot) === peer[1])?.name || 'Agent ' + peer[1];
 }
 
 export function taskLabel(task: TaskItem): string {
@@ -90,41 +99,50 @@ function outcomeLines(view: View): string[] {
   return lines;
 }
 
-/** The compact board shown above the editor; `rows` bounds its height. */
-export function renderBoard(view: View, width: number, rows = 14, hint = '/delm:board tasks|shared|checks · /delm:board hide'): string[] {
+/** Pi shows at most this many widget lines and appends "widget truncated" beyond it. */
+export const WIDGET_ROWS = 10;
+
+/** The compact board shown above the editor; it never exceeds `rows` lines. */
+export function renderBoard(view: View, width: number, rows = WIDGET_ROWS, hint = '/delm:board tasks|shared|checks · /delm:board hide'): string[] {
   const inner = Math.max(20, width - 2);
-  const lines: string[] = ['DeLM · ' + phaseLabel(view) + (view.revision && view.revision > 1 ? ' · revision ' + view.revision : '')];
+  const head: string[] = ['DeLM · ' + phaseLabel(view) + (view.revision && view.revision > 1 ? ' · revision ' + view.revision : '')];
   const unavailable = view.freshness?.unavailable || [];
-  if (unavailable.includes('board')) lines.push('  Some updates are temporarily unavailable');
-  if (!view.agents.length) lines.push('  Waiting for agents to start');
+  if (unavailable.includes('board')) head.push('  Some updates are temporarily unavailable');
+  if (!view.agents.length) head.push('  Waiting for agents to start');
   for (const agent of view.agents) {
     const task = view.tasks.items.find(item => (agent.task_ids || []).map(String).includes(String(item.id)));
-    const head = '  ' + agent.name + ' · ' + agentState(agent);
-    lines.push(fit(head + (task ? ' · ' + taskLabel(task) + ' ' + task.title : ''), inner));
-  }
-  const open = view.tasks.items.filter(task => !['done', 'completed'].includes(task.state));
-  const done = view.tasks.items.filter(task => ['done', 'completed'].includes(task.state));
-  const ordered = [...open, ...done];
-  const budget = Math.max(1, Math.min(4, rows - lines.length - 5));
-  const shown = ordered.slice(0, budget);
-  lines.push('Task queue · ' + view.tasks.total + (view.tasks.total > shown.length ? ' · ' + shown.length + ' shown' : ''));
-  if (!shown.length) lines.push('  ' + (unavailable.includes('board') ? 'Tasks temporarily unavailable' : 'No tasks shared yet'));
-  for (const task of shown) {
-    const tail = ' · ' + taskState(task, view);
-    const prefix = '  ' + taskLabel(task) + ' ';
-    lines.push(prefix + fit(task.title, Math.max(1, inner - prefix.length - tail.length)) + tail);
+    const label = '  ' + agent.name + ' · ' + agentState(agent, view);
+    head.push(fit(label + (task ? ' · ' + taskLabel(task) + ' ' + task.title : ''), inner));
   }
   const shared = view.shared.items[0];
-  lines.push('Shared context · ' + view.shared.total + (view.checks.total ? ' · ' + view.checks.total + ' checks' : ''));
-  if (!shared) lines.push('  ' + (unavailable.includes('board') ? 'Shared context temporarily unavailable' : 'No findings or code shared yet'));
+  const sharedLines = ['Shared context · ' + view.shared.total + (view.checks.total ? ' · ' + view.checks.total + ' checks' : '')];
+  if (!shared) sharedLines.push('  ' + (unavailable.includes('board') ? 'Shared context temporarily unavailable' : 'No findings or code shared yet'));
   else {
     const imports = (shared.imports || []).map(item => agentName(view, typeof item === 'object' && item ? (item as {worker_id?: unknown}).worker_id : item));
     const tail = ' · ' + agentName(view, shared.worker) + (imports.length ? ' · Imported by ' + imports.join(', ') : '');
-    lines.push('  ' + fit(shared.title, Math.max(1, inner - 2 - tail.length)) + tail);
+    sharedLines.push('  ' + fit(shared.title, Math.max(1, inner - 2 - tail.length)) + tail);
   }
-  lines.push(...outcomeLines(view).map(line => '  ' + fit(line, inner - 2)));
-  if (hint) lines.push(fit(hint, inner));
-  return lines.map(line => fit(line, width));
+  const outcome = outcomeLines(view).map(line => '  ' + fit(line, inner - 2));
+  const hintLines = hint ? [fit(hint, inner)] : [];
+  const open = view.tasks.items.filter(task => !['done', 'completed'].includes(task.state));
+  const done = view.tasks.items.filter(task => ['done', 'completed'].includes(task.state));
+  const ordered = [...open, ...done];
+  // The queue takes whatever height the fixed sections leave; the hint goes first when even one task would not fit.
+  const fixed = head.length + 1 + sharedLines.length + outcome.length;
+  let budget = Math.min(4, rows - fixed - hintLines.length);
+  if (budget < 1 && ordered.length && hintLines.length) { hintLines.length = 0; budget = Math.min(4, rows - fixed); }
+  const shown = ordered.slice(0, Math.max(0, budget));
+  const queue = ['Task queue · ' + view.tasks.total + (view.tasks.total > shown.length ? ' · ' + shown.length + ' shown' : '')];
+  if (!shown.length && !ordered.length) queue.push('  ' + (unavailable.includes('board') ? 'Tasks temporarily unavailable' : 'No tasks shared yet'));
+  for (const task of shown) {
+    const tail = ' · ' + taskState(task, view);
+    const prefix = '  ' + taskLabel(task) + ' ';
+    queue.push(prefix + fit(task.title, Math.max(1, inner - prefix.length - tail.length)) + tail);
+  }
+  const lines = [...head, ...queue, ...sharedLines, ...outcome, ...hintLines];
+  // Pi appends its own truncation notice beyond `rows`, so the board drops its least important lines instead.
+  while (lines.length > rows && hintLines.length) { lines.pop(); hintLines.pop(); }
+  return lines.slice(0, rows).map(line => fit(line, width));
 }
 
 /** A full collection for the detail overlay. */

@@ -86,7 +86,8 @@ the task queue, the latest shared contribution and the recorded-check count, and
 run ends. It is rendered from the passive observer (`delm pi view --watch`), which reads the run records
 without touching the controller. `/delm:board hide` hides it for the run, `/delm:status` or `/delm:board`
 reopens it, and `/delm:board tasks|shared|checks` opens a scrollable detail overlay (Esc closes). The
-final state stays visible until hidden or until the next run starts.
+final state stays visible until hidden or until the next run starts. Pi shows at most ten widget lines,
+so the board sizes its task rows to fit and drops the hint line before any task row.
 
 ### Recovery
 
@@ -131,5 +132,11 @@ Exercised so far:
   project; a killed session left no worker process, the next session reported the unfinished run, and
   `/delm:recover` saved its changes and released the project. It bills the provider login and is run
   explicitly, not by `npm test`.
+
+- the interactive TUI, driven through a pseudo-terminal on Pi 1.4.0 (2026-10-24): `/delm:run` on a
+  four-part package request filled the queue within ten seconds, `/delm:board tasks` opened the overlay
+  and Esc closed it, `/delm:board hide` and `/delm:status` hid and reopened the board, `/delm:stop` left
+  the project unchanged with no worker process, and a second run delivered nine files with the final
+  board repainted at Complete and no Pi truncation notice.
 
 Not exercised yet: steering an actively streaming worker from the UI, a parent restart with recovery, forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.

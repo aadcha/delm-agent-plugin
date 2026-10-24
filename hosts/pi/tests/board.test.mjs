@@ -22,7 +22,7 @@ test('the compact board mirrors the Claude board: phase, agents, queue, shared c
   const lines = renderBoard(view, 80);
   assert.equal(lines[0], 'DeLM · Working · revision 2');
   assert.match(lines[1], /^  Agent 1 · Working · #1 Implement the parser/);
-  assert.match(lines[2], /^  Agent 2 · Waiting on worker:1$/);
+  assert.match(lines[2], /^  Agent 2 · Waiting on Agent 1$/);
   assert.equal(lines[3], 'Task queue · 3');
   assert.match(lines[4], /^  #1 .*… · Claimed by Agent 1$/);
   assert.match(lines[5], /^  #2 Write tests · Available$/);
@@ -40,6 +40,21 @@ test('phases and outcomes use the Claude labels', () => {
   assert.equal(phaseLabel({...view, status: 'what'}), 'Status unavailable');
   const done = renderBoard({...view, status: 'complete', finished: true, outcome: {status: 'complete', delivered: true, changed_paths_count: 2}}, 80);
   assert.ok(done.some(line => line.includes('Changes applied to your project · 2 files.')));
+});
+
+test('the board fits inside the ten lines Pi shows for a widget', () => {
+  const busy = {...view, tasks: {items: [...view.tasks.items, {id: 7, task_number: 4, title: 'More', owner: null, state: 'open'},
+    {id: 8, task_number: 5, title: 'Even more', owner: null, state: 'open'}], total: 5}};
+  const lines = renderBoard(busy, 80);
+  assert.ok(lines.length <= 10, String(lines.length));
+  assert.equal(lines[3], 'Task queue · 5 · 3 shown');
+  assert.match(lines.at(-1), /\/delm:board/);
+  const ended = renderBoard({...busy, status: 'stopped', finished: true, outcome: {status: 'stopped', recovery_saved: true, reason: 'Stopped by the user'}}, 80);
+  assert.ok(ended.length <= 10, String(ended.length));
+  assert.match(ended[1], /^  Agent 1 · Stopped/);
+  assert.equal(ended[2], '  Agent 2 · Stopped');
+  assert.ok(ended.some(line => line.includes('Unfinished changes were saved for recovery.')));
+  assert.ok(ended.some(line => line.startsWith('  #1 ')), 'at least one task row survives');
 });
 
 test('agent and task states read like the Claude board', () => {
