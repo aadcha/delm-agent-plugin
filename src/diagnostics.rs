@@ -140,7 +140,14 @@ fn inspect(path: &Path) -> Result<RunInfo> {
     );
     // Pi shares the Claude record layout; the record names its host.
     let (host, state) = if let Some(value) = claude {
-        (if value["host"] == "pi" { "pi" } else { "claude" }, value)
+        (
+            if value["host"] == "pi" {
+                "pi"
+            } else {
+                "claude"
+            },
+            value,
+        )
     } else if let Some(value) = codex {
         ("codex", value)
     } else {
