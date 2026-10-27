@@ -162,4 +162,8 @@ Exercised so far:
   the project unchanged with no worker process (checked by pid), and a second run delivered nine files with the final
   board repainted at Complete and no Pi truncation notice.
 
-Not exercised yet: steering an actively streaming worker from the UI, resuming stopped workers after an extension reload (the tokened `recover` path Claude Code uses; Pi only saves and releases), forked session inheritance against a real session file, Intel macOS, and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.
+- CI (`.github/workflows/pi-host.yml`, first green run 2026-10-26): the runtime build, package staging and
+  validation, the Pi suite with the fake-worker lifecycle, the installer's Pi tests and the controller tests
+  pass on both `macos-15` (arm64) and `macos-15-intel` (x86_64) with Pi 1.4.0.
+
+Not exercised yet: steering an actively streaming worker from the UI, resuming stopped workers after an extension reload (the tokened `recover` path Claude Code uses; Pi only saves and releases), forked session inheritance against a real session file, a long multi-hour task with auto-compaction, Linux (deferred; the runtime's process supervision is macOS-only), and distribution through the npm installer. See [development](development.md#pi-plugin) for the contributor build.
