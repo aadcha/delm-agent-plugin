@@ -45,6 +45,10 @@ The build stages `.build/plugin-pi/` with the runtime, both extensions, the shar
 
 For one session without installing, use `pi -e /absolute/path/to/this-checkout/hosts/pi/extensions/delm.ts` with `DELM_PI_RUNTIME` pointing at a built runtime; the worker extension is loaded by path into each worker. With the package also installed, the most recently loaded copy of the parent extension owns the session and the other copy hands its commands to it, and a second worker copy stands down when the board server is already registered, so `pi remove` is not required. The checkout's `hosts/pi/worker.md` is a development copy of `plugin/worker.md`; the build stages the shared file and the unit tests fail if the copies drift.
 
+The model-free Pi checks also run in CI (`.github/workflows/pi-host.yml`) on Apple Silicon and Intel macOS
+runners against the pinned Pi release: runtime build, package staging and validation, the Pi suite, the
+installer's Pi tests and the controller tests.
+
 Account-backed lifecycle checks, run explicitly because they start real workers on the provider login Pi uses:
 
 ```sh
