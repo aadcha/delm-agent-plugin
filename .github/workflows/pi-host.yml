@@ -77,14 +77,17 @@ jobs:
       - name: Pi host suite (unit tests and the fake-worker lifecycle)
         env:
           DELM_PI_RUNTIME: ${{ github.workspace }}/.build/plugin-pi/bin/delm
+          ARCH: ${{ matrix.architecture }}
         run: |
           cd hosts/pi
-          node --test --experimental-strip-types tests/*.test.mjs 2>&1 | tee "$RUNNER_TEMP/pi-tests-${{ matrix.architecture }}.txt"
+          node --test --experimental-strip-types tests/*.test.mjs 2>&1 | tee "$RUNNER_TEMP/pi-tests-$ARCH.txt"
           test "${PIPESTATUS[0]}" -eq 0
       - name: Installer tests for the Pi package
+        env:
+          ARCH: ${{ matrix.architecture }}
         run: |
           cd scripts
-          python3 -m unittest test_installation -k pi_ -v 2>&1 | tee "$RUNNER_TEMP/pi-installer-${{ matrix.architecture }}.txt"
+          python3 -m unittest test_installation -k pi_ -v 2>&1 | tee "$RUNNER_TEMP/pi-installer-$ARCH.txt"
           test "${PIPESTATUS[0]}" -eq 0
       - name: Controller tests
         run: cargo test --release --locked --lib -q claude::
