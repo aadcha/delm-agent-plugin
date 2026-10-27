@@ -90,7 +90,7 @@ jobs:
           python3 -m unittest test_installation -k pi_ -v 2>&1 | tee "$RUNNER_TEMP/pi-installer-$ARCH.txt"
           test "${PIPESTATUS[0]}" -eq 0
       - name: Controller tests
-        run: cargo test --release --locked --lib -q claude::
+        run: cargo test --release --locked --lib -q "claude::"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
